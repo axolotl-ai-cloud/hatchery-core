@@ -1,0 +1,42 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Hatchery Open Core",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Overview",
+        "pages": [
+          "content/docs/index"
+        ]
+      },
+      {
+        "group": "Getting Started",
+        "pages": [
+          "content/docs/getting-started/quickstart",
+          "content/docs/getting-started/self-hosting",
+          "content/docs/getting-started/deployment"
+        ]
+      },
+      {
+        "group": "Learn",
+        "pages": [
+          "content/docs/learn/architecture",
+          "content/docs/learn/open-core"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "content/docs/reference/endpoints"
+        ]
+      },
+      {
+        "group": "Development",
+        "pages": [
+          "content/docs/development/extending",
+          "content/docs/development/testing"
+        ]
+      }
+    ]
+  }
+}

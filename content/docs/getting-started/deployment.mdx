@@ -1,0 +1,110 @@
+---
+title: Deployment
+description: Deploy the open-core Hatchery service with local or extension-provided backends.
+---
+
+This document covers deploying Hatchery Core on your own infrastructure.
+Extension packages can add production backends (Redis, Postgres, S3),
+auth providers, and fleet management.
+
+For most open-core users, start with [Self-hosting](self-hosting).
+
+## Recommended Open-Core Deployment
+
+Use a single process or a tightly coupled single node unless you have supplied
+shared queue and metadata backends through a custom `Config`.
+
+Recommended first deployment:
+
+```bash
+python -m hatchery.core.local_dev
+```
+
+Recommended private GPU deployment:
+
+```bash
+uv pip install -e '.[gpu,test]'
+export HATCHERY_DEV_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+export HATCHERY_DEV_DEVICE=cuda:0
+export HATCHERY_DEV_API_KEY=hatchery_change_me
+python -m hatchery.core.local_dev
+```
+
+## Separate Gateway And Worker
+
+Do this only when gateway and worker share durable metadata and queue
+implementations.
+
+The default core config uses in-memory metadata and queue, so two separate
+processes will not coordinate jobs out of the box.
+
+Use `HATCHERY_CONFIG_FACTORY` to wire shared implementations:
+
+```bash
+export HATCHERY_CONFIG_FACTORY='my_package.config:build_config'
+uvicorn 'my_package.app:create_app' --factory --host 0.0.0.0 --port 8420
+```
+
+Worker:
+
+```bash
+export HATCHERY_CONFIG_FACTORY='my_package.config:build_config'
+export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+python -m hatchery.core.worker
+```
+
+## Reverse Proxy
+
+Put a reverse proxy in front of the gateway for:
+
+- TLS
+- request body limits
+- request timeout
+- access logs
+- rate limiting
+
+Example nginx concepts:
+
+```nginx
+client_max_body_size 25m;
+proxy_read_timeout 650s;
+proxy_send_timeout 650s;
+```
+
+Tune limits for your workload.
+
+## Persistence
+
+For simple deployments:
+
+```bash
+export HATCHERY_OBJECT_STORE=local
+export HATCHERY_LOCAL_STORE_PATH=/var/lib/hatchery
+```
+
+Back up this directory if checkpoints matter.
+
+For multi-node persistence, provide an `ObjectStore` implementation through
+an extension package or config factory.
+
+## Security Notes
+
+- Always set `HATCHERY_ADMIN_API_KEY`.
+- Do not expose bearer-token auth over plain HTTP on untrusted networks.
+- Treat object-store state as sensitive model data.
+- Do not let users write arbitrary files into the object store.
+- Keep Hugging Face model cache directories private.
+- Prefer model allow-lists for shared deployments.
+
+## Scaling Boundary
+
+Open core gives you the interfaces needed to scale:
+
+- `JobQueue`
+- `MetadataStore`
+- `ObjectStore`
+- `SessionRegistry`
+- `MetricsCollector`
+
+It does not ship production shared implementations for every environment.
+Add those through extension packages.

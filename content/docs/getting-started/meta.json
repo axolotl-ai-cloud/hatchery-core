@@ -1,0 +1,9 @@
+{
+  "title": "Getting Started",
+  "defaultOpen": true,
+  "pages": [
+    "quickstart",
+    "self-hosting",
+    "deployment"
+  ]
+}

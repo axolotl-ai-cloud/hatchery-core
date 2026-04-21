@@ -1,0 +1,81 @@
+---
+title: Testing
+---
+
+## Install Test Dependencies
+
+```bash
+uv pip install -e '.[test]'
+```
+
+For GPU tests:
+
+```bash
+uv pip install -e '.[gpu,test]'
+```
+
+## Run Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
+## Torch / GPU Tests
+
+Torch-specific tests live under `tests/torch_tests/`:
+
+```bash
+python -m pytest tests/torch_tests/ -q
+```
+
+## Lint
+
+```bash
+ruff check hatchery/ tests/
+ruff format --check hatchery/ tests/
+```
+
+Apply formatting:
+
+```bash
+ruff format hatchery/ tests/
+```
+
+## Type Check
+
+```bash
+mypy hatchery/
+```
+
+## Security Static Analysis
+
+```bash
+bandit -q -r hatchery/ --configfile pyproject.toml
+```
+
+## Focused Runs
+
+```bash
+# Auth and gateway
+python -m pytest tests/test_auth.py tests/test_gateway.py -q
+
+# Tinker compatibility
+python -m pytest tests/test_tinker_compat.py tests/test_tinker_sdk_contract.py -q
+
+# Middleware
+python -m pytest tests/test_compression_middleware.py -q
+
+# Queue / session state
+python -m pytest tests/test_queue.py tests/test_session_store.py -q
+
+# Loss functions
+python -m pytest tests/torch_tests/test_losses.py -q
+```
+
+## Test Guidelines
+
+- Use in-memory backends for fast unit tests.
+- Use local filesystem object store for persistence tests.
+- Mark GPU tests with `@pytest.mark.gpu`.
+- Use `pytest.importorskip` for optional dependencies.
+- Add regression tests for auth, ownership, and route compatibility bugs.

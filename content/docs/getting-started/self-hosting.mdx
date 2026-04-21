@@ -1,0 +1,226 @@
+---
+title: Self-Hosting Open Core
+description: Run hatchery.core outside the local dev launcher without external services.
+---
+
+This guide covers self-hosting `hatchery.core`. It intentionally avoids external
+SaaS features such as billing, enterprise SSO, managed worker fleets, and
+production shared-storage integrations.
+
+## Supported Open-Core Shapes
+
+### Single Process
+
+Best for development and demos.
+
+```bash
+python -m hatchery.core.local_dev
+```
+
+This runs the gateway and a worker in one process with in-memory backends.
+
+### Single Node With Local Storage
+
+Best for a small private deployment on one machine.
+
+Use:
+
+- FastAPI gateway
+- local filesystem object store
+- in-memory metadata and queue if gateway and worker share a process
+- GPU worker on the same host
+
+For most users, the local dev launcher is still the simplest version of this.
+
+### Custom Shared Backends
+
+For a multi-process open-core deployment, the gateway and workers need shared
+metadata and queue backends. Core ships protocols and simple local backends;
+external packages can provide concrete shared backends.
+
+Use `HATCHERY_CONFIG_FACTORY` to inject your own config:
+
+```bash
+export HATCHERY_CONFIG_FACTORY='my_package.config:build_config'
+python -m hatchery.core.worker
+```
+
+The callable should return an `hatchery.core.config.Config`.
+
+## Minimal Production Hygiene
+
+Set a stable admin key:
+
+```bash
+export HATCHERY_ADMIN_API_KEY="$(python -c 'import secrets; print("hatchery_" + secrets.token_urlsafe(32))')"
+```
+
+Use a persistent object store root:
+
+```bash
+export HATCHERY_OBJECT_STORE=local
+export HATCHERY_LOCAL_STORE_PATH=/var/lib/hatchery
+```
+
+Run behind TLS. The core gateway accepts bearer tokens. Do not expose it over
+plain HTTP on an untrusted network.
+
+Set conservative process limits:
+
+- maximum request body size at the reverse proxy
+- request timeout
+- worker memory limit
+- GPU process supervision
+
+## Gateway
+
+Programmatic startup:
+
+```python
+from hatchery.core.gateway import create_app
+
+app = create_app()
+```
+
+Uvicorn:
+
+```bash
+export HATCHERY_ADMIN_API_KEY=hatchery_change_me
+uvicorn hatchery.core.gateway:create_app --factory --host 0.0.0.0 --port 8420
+```
+
+The default `build_core_config()` uses:
+
+- `APIKeyAuthProvider`
+- `InMemoryMetadataStore`
+- `InMemoryJobQueue`
+- `LocalObjectStore` unless `HATCHERY_OBJECT_STORE=memory`
+- `LogMetrics`
+
+That is enough for a single-process app, but a separate gateway and worker
+will not share in-memory metadata or queue state. Use an injected config if
+you need multiple processes.
+
+## Worker
+
+Single GPU:
+
+```bash
+export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+export HATCHERY_WORKER_DEVICE=cuda:0
+python -m hatchery.core.worker
+```
+
+Script helper:
+
+```bash
+HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct ./hatchery/core/scripts/run_worker.sh
+```
+
+Multi-process torchrun:
+
+```bash
+NPROC=2 HATCHERY_DP_DEGREE=2 ./hatchery/core/scripts/run_worker.sh
+```
+
+The script checks:
+
+```text
+NPROC == HATCHERY_DP_DEGREE * HATCHERY_TP_DEGREE * HATCHERY_CP_DEGREE
+```
+
+## Config Factory
+
+A config factory is the clean way to wire self-hosted backends.
+
+Example:
+
+```python
+# my_package/config.py
+from hatchery.core.config import Config
+from hatchery.core.backends.auth.api_key import APIKeyAuthProvider
+from hatchery.core.backends.metrics.log import LogMetrics
+
+
+def build_config() -> Config:
+    auth = APIKeyAuthProvider()
+    auth.add_key("dev-key", user_id="admin", max_concurrent_sessions=100, max_rank=256)
+
+    metadata = ...
+    queue = ...
+    objects = ...
+    compute = ...
+
+    return Config(
+        auth=auth,
+        metadata=metadata,
+        objects=objects,
+        queue=queue,
+        compute=compute,
+        metrics=LogMetrics(),
+    )
+```
+
+Then:
+
+```bash
+export HATCHERY_CONFIG_FACTORY='my_package.config:build_config'
+python -m hatchery.core.worker
+```
+
+## Storage
+
+Open core object store options:
+
+- `HATCHERY_OBJECT_STORE=local`
+- `HATCHERY_OBJECT_STORE=memory`
+
+Local storage:
+
+```bash
+export HATCHERY_OBJECT_STORE=local
+export HATCHERY_LOCAL_STORE_PATH=/var/lib/hatchery
+```
+
+Object keys are relative paths under the configured root. Do not share this
+directory with untrusted users.
+
+## Authentication
+
+Core ships simple API-key auth.
+
+Set:
+
+```bash
+export HATCHERY_ADMIN_API_KEY=hatchery_your_secret
+```
+
+If `HATCHERY_ADMIN_API_KEY` is unset, the core config mints a one-time key and prints
+it to logs. That is useful for first boot, but a stable key is better for any
+real deployment.
+
+## What Open Core Does Not Include
+
+Open core intentionally does not provide:
+
+- managed billing or prepaid balances
+- payment processing
+- enterprise SSO integration
+- production shared-storage backends
+- cloud worker provisioning
+- public checkpoint publishing
+- checkpoint TTL sweeps
+- multi-replica gateway registry
+
+Those belong in extension packages.
+
+## Operational Checklist
+
+- Set `HATCHERY_ADMIN_API_KEY`.
+- Run behind TLS.
+- Restrict network access to the gateway.
+- Put a request-size cap in front of the gateway.
+- Keep model cache and object-store directories private.
+- Use pinned model IDs/revisions for repeatable deployments.
+- Monitor worker logs for failed jobs and OOMs.
+- Back up `HATCHERY_LOCAL_STORE_PATH` if using local storage for important sessions.

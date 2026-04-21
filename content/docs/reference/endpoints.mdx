@@ -1,0 +1,239 @@
+---
+title: API Guide
+description: Hatchery's Tinker-compatible API and session management endpoints.
+---
+
+Hatchery exposes training operations through the **Tinker-compatible API** at
+`/api/v1/*`, matching the official [Tinker SDK](https://pypi.org/project/tinker/)
+wire protocol. A lightweight **session management** surface at `/v1/*` handles
+session CRUD, checkpointing, and health checks.
+
+All protected routes accept either:
+
+```text
+Authorization: Bearer <token>
+```
+
+or:
+
+```text
+X-API-Key: <token>
+```
+
+## Tinker-Compatible API (`/api/v1/*`)
+
+These routes implement the Tinker SDK futures-based protocol. Each training
+operation returns an `UntypedAPIFuture` envelope; call `/api/v1/retrieve_future`
+to get the result. The Hatchery `HatcheryClient` handles this automatically.
+
+### Health
+
+```http
+GET /api/v1/healthz
+```
+
+### Server Capabilities
+
+```http
+GET /api/v1/get_server_capabilities
+POST /api/v1/get_server_capabilities
+```
+
+Returns supported loss functions, sampling params, and feature flags.
+
+### Create Session
+
+```http
+POST /api/v1/create_session
+```
+
+### Create Model (Session + Init)
+
+```http
+POST /api/v1/create_model
+```
+
+Request:
+
+```json
+{
+  "session_id": "my-session",
+  "model_seq_id": 0,
+  "base_model": "Qwen/Qwen2-0.5B-Instruct",
+  "lora_config": {"rank": 32}
+}
+```
+
+Send `"lora_config": null` for full-parameter fine-tuning.
+
+### Forward/Backward
+
+```http
+POST /api/v1/forward_backward
+```
+
+### Forward Only
+
+```http
+POST /api/v1/forward_only
+```
+
+### Custom Loss (Two-Step)
+
+```http
+POST /api/v1/forward_backward_custom_step1
+POST /api/v1/forward_backward_custom_step2
+```
+
+### Forward (Logprobs)
+
+```http
+POST /api/v1/forward
+```
+
+### Optimizer Step
+
+```http
+POST /api/v1/optim_step
+```
+
+### Sample
+
+```http
+POST /api/v1/asample
+```
+
+### Save Weights
+
+```http
+POST /api/v1/save_weights
+```
+
+Copies LoRA weights, optimizer state, and gradient accumulation to a
+checkpoint. Compatible with the official Tinker SDK's `save_state()`.
+
+### Save State (Full Training State)
+
+```http
+POST /api/v1/save_state
+```
+
+### Load Weights
+
+```http
+POST /api/v1/load_weights
+```
+
+### List Checkpoints
+
+```http
+GET /api/v1/training_runs/{model_id}/checkpoints
+```
+
+### Delete Checkpoint
+
+```http
+DELETE /api/v1/training_runs/{model_id}/checkpoints/{checkpoint_id}
+```
+
+### Retrieve Future
+
+```http
+POST /api/v1/retrieve_future
+```
+
+Polls for the result of any async operation.
+
+### Telemetry
+
+```http
+POST /api/v1/telemetry
+```
+
+SDK client-side telemetry ingestion.
+
+## Session Management (`/v1/*`)
+
+### Health
+
+```http
+GET /v1/health
+```
+
+### Create Session
+
+```http
+POST /v1/sessions
+```
+
+### Get Session
+
+```http
+GET /v1/sessions/{session_id}
+```
+
+### List Sessions
+
+```http
+GET /v1/sessions
+```
+
+### Resume Session
+
+```http
+POST /v1/sessions/{session_id}/resume
+```
+
+### Delete Session
+
+```http
+DELETE /v1/sessions/{session_id}
+```
+
+### Save Weights (Checkpoint)
+
+```http
+POST /v1/save_weights
+```
+
+### List Checkpoints
+
+```http
+GET /v1/sessions/{session_id}/checkpoints
+```
+
+### Get Job
+
+```http
+GET /v1/jobs/{job_id}
+```
+
+## Extensions
+
+When extension packages are installed, additional routes are available:
+
+- `/v1/billing/*` — balance, transactions, auto-reload, add-funds
+- `/v1/admin/auth/*` — SSO login/callback/whoami
+- `/internal/*` — worker registration and heartbeat (HMAC-authenticated)
+- `/api/v1/training_runs/{model_id}/checkpoints/{id}/archive` — presigned download URL
+- `/api/v1/training_runs/{model_id}/checkpoints/{id}/publish` — toggle public visibility
+- `/api/v1/training_runs/{model_id}/checkpoints/{id}/ttl` — update checkpoint TTL
+
+## SDK Compatibility
+
+Hatchery is compatible with the official Tinker SDK (`pip install tinker`).
+The `HatcheryClient` in `hatchery.core.client` provides the same interface:
+
+```python
+from hatchery.core.client import HatcheryClient
+
+client = HatcheryClient(base_url="http://localhost:8765", token="...")
+tc = client.create_lora_training_client("Qwen/Qwen2-0.5B-Instruct", rank=32)
+tc.forward_backward([datum]).result()
+tc.optim_step(learning_rate=1e-4).result()
+tc.save_weights("checkpoint-1")
+```
+
+The `save_weights` method copies LoRA weights, optimizer state, and
+gradient accumulation to the checkpoint, matching the official SDK's
+`save_state()` behavior.

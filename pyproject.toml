@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hatchery-core"
+version = "0.1.0"
+description = "Tinker-compatible LoRA training platform with pluggable backends"
+requires-python = ">=3.12"
+authors = [{name = "Wing Lian"}]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "msgpack>=1.0",
+    "aiosqlite>=0.19",
+    "structlog>=24.1",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "torch==2.10",
+    "transformers>=5.5.4",
+    "peft>=0.10",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "brotli>=1.1",
+    "zstandard>=0.22",
+]
+dev = [
+    "pre-commit>=3.7",
+    "ruff>=0.5",
+    "mypy>=1.11",
+    "bandit>=1.7",
+    "types-PyYAML",
+]
+
+[tool.setuptools.packages.find]
+include = ["hatchery*"]
+exclude = ["*tests*", "*examples*", "*scripts*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "gpu: tests that require a real CUDA device",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",
+    "E731",
+    "B008",
+    "B904",
+    "SIM105",
+    "SIM108",
+    "SIM117",
+    "UP007",
+    "UP045",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401", "F811"]
+"hatchery/*/examples/*" = ["F401"]
+"hatchery/*/scripts/*" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = false
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = false
+files = ["hatchery/core"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+    "hatchery.core.protocols",
+    "hatchery.core.errors",
+]
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "hatchery.core.worker"
+ignore_errors = false
+disable_error_code = ["union-attr", "arg-type", "call-arg", "assignment", "misc", "list-item"]
+
+[tool.bandit]
+skips = ["B101", "B108", "B110", "B311", "B403", "B404", "B603", "B607", "B608", "B614", "B615"]
+exclude_dirs = ["tests", "hatchery/core/examples", "hatchery/core/scripts", ".venv", "venv"]

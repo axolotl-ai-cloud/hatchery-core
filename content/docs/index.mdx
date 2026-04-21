@@ -1,0 +1,40 @@
+---
+title: Hatchery Open Core
+description: Learn, run, self-host, and extend the open-core Hatchery training platform.
+---
+
+Hatchery is an asynchronous post-training API for LoRA fine-tuning and reinforcement-learning workflows. The open-core package gives you the gateway, worker, trainer, local storage backends, API-key auth, native HTTP API, and Tinker-compatible routes needed to run locally or self-host.
+
+## Start Here
+
+- [Quickstart](getting-started/quickstart): run the local gateway and worker.
+- [Architecture](learn/architecture): understand the control plane, worker, storage, and job flow.
+- [API endpoints](reference/endpoints): use the native and Tinker-compatible HTTP surfaces.
+- [Self-hosting](getting-started/self-hosting): run open core outside the local dev launcher.
+
+## Project Shape
+
+The repository is split into two packages under one import root:
+
+| Package | Role |
+| --- | --- |
+| `hatchery.core` | Open-source local and self-hosted training platform |
+| extension packages | Extension packages for production deployment |
+
+The intended dependency direction is:
+
+```text
+extensions -> hatchery.core  allowed
+hatchery.core   -> extensions not allowed
+```
+
+Core owns capabilities such as training sessions, checkpoint save/load, sampling protocols, local workers, and extension contracts. Extensions own monetization, auth, fleet orchestration, and production infrastructure.
+
+## Documentation Structure
+
+These docs are written as framework-neutral MDX:
+
+- Fumadocs reads this tree from `content/docs` through `source.config.ts` and uses `meta.json` files for sidebar order.
+- Mintlify reads the same pages through the root `docs.json` navigation file.
+
+Keep product content in the MDX pages and keep framework-specific navigation in the small config files.

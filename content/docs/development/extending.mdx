@@ -1,0 +1,174 @@
+---
+title: Extending Hatchery Core
+description: Add protocols, backend implementations, and extension behavior around hatchery.core.
+---
+
+Hatchery core is designed around protocols and plugins. Core code should depend on
+interfaces, while concrete production behavior lives in backend modules or
+extension packages.
+
+## Add A Backend
+
+Start with `hatchery/core/protocols.py`.
+
+Common protocols:
+
+- `AuthProvider`
+- `ObjectStore`
+- `MetadataStore`
+- `JobQueue`
+- `MetricsCollector`
+- `SessionRegistry`
+- `LoraStatePersister`
+- `OptimizerStatePersister`
+
+Implement the protocol in your package, then return it from a config factory.
+
+Example:
+
+```python
+from hatchery.core.config import Config
+from hatchery.core.backends.auth.api_key import APIKeyAuthProvider
+from hatchery.core.backends.metrics.log import LogMetrics
+
+
+def build_config() -> Config:
+    auth = APIKeyAuthProvider()
+    auth.add_key("hatchery_secret", user_id="admin", max_concurrent_sessions=100, max_rank=256)
+
+    return Config(
+        auth=auth,
+        metadata=MyMetadataStore(...),
+        objects=MyObjectStore(...),
+        queue=MyJobQueue(...),
+        compute=MyComputeBackend(...),
+        metrics=LogMetrics(),
+    )
+```
+
+Run with:
+
+```bash
+export HATCHERY_CONFIG_FACTORY='my_package.config:build_config'
+python -m hatchery.core.worker
+```
+
+## Add Gateway Behavior
+
+Use `hatchery.core.plugins.GATEWAY_PLUGINS`.
+
+Plugin hook types:
+
+- token auth hook
+- lifespan startup/shutdown hooks
+- routers
+- pre-operation hooks
+- post-operation hooks
+- payload signers
+- payload verifiers
+
+Example:
+
+```python
+from fastapi import APIRouter
+from hatchery.core.plugins import GATEWAY_PLUGINS
+
+router = APIRouter(prefix="/v1/example")
+
+
+@router.get("/ping")
+async def ping():
+    return {"ok": True}
+
+
+def install_plugins() -> None:
+    GATEWAY_PLUGINS.routers.append(router)
+```
+
+Call `install_plugins()` before `hatchery.core.gateway.create_app()`.
+
+## Add Auth
+
+For simple API-key auth, use `APIKeyAuthProvider`.
+
+For external auth, implement:
+
+```python
+class MyAuthProvider:
+    async def authenticate(self, token: str):
+        ...
+
+    async def authorize(self, user, action: str, resource: str) -> bool:
+        ...
+```
+
+If your auth is token-only and should run before the configured provider,
+register a token auth plugin.
+
+## Add Billing Or Quotas
+
+Billing is not a core feature. Implement it as plugin behavior:
+
+- pre-op hook: estimate and hold
+- post-op hook: settle or release
+
+The native gateway path already supports pre/post hooks. If you add new
+routes that enqueue jobs, make sure they also run the same hooks.
+
+## Add A State Persister
+
+LoRA and optimizer state persistence are injected:
+
+- `Config.lora_state`
+- `Config.optimizer_state`
+
+Implement the relevant protocol if you need a different format.
+
+Rules:
+
+- keep object-store paths stable
+- materialize checkpoints into self-contained snapshots
+- avoid unsafe deserialization for untrusted bytes
+- keep metadata backward-compatible where possible
+
+## Add Tinker SDK Compatibility
+
+Tinker-compatible route shapes live in `hatchery/core/tinker_compat.py`.
+
+Guidelines:
+
+- keep SDK wire compatibility there
+- convert SDK request shapes into worker payloads before enqueue
+- return future-style responses when the SDK expects them
+- ensure ownership and quota checks match native routes
+- ensure pre/post hooks run for metered operations
+
+## Open Core Boundary
+
+Core extension points should remain vendor-neutral.
+
+Appropriate for core:
+
+- protocol definitions
+- local/in-memory implementations
+- generic gateway and worker behavior
+- local training and sampling
+- basic checkpoint save/load
+
+Better in an extension package:
+
+- vendor-specific integrations (payment, SSO, analytics)
+- production database and object store backends
+- cloud worker provisioning
+- metering and invoice logic
+- production inference pool management
+
+## Boundary Checks
+
+Before adding a feature to `hatchery.core`, ask:
+
+- Can a self-hosted user use this without external services?
+- Is this a generic capability rather than a deployment-specific policy?
+- Could this be a protocol in core and an implementation in an extension?
+- Does this introduce a dependency that breaks torch-free or local installs?
+- Does it preserve `hatchery.core` importing cleanly without extensions?

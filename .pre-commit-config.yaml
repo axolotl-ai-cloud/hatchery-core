@@ -1,0 +1,43 @@
+default_language_version:
+    python: python3
+
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    -   id: check-yaml
+    -   id: end-of-file-fixer
+    -   id: trailing-whitespace
+    -   id: check-merge-conflict
+    -   id: check-added-large-files
+        args: ['--maxkb=1024']
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.8
+    hooks:
+    -   id: ruff
+        args: [--fix]
+    -   id: ruff-format
+-   repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.19.1
+    hooks:
+    - id: mypy
+      # Scope mypy to the files whose types we're willing to maintain
+      # strictly — protocols + errors. Everything else is Python duck
+      # typing over async/torch/httpx interfaces that mypy struggles
+      # with, and fighting it gives us no real safety. Full-codebase
+      # mypy coverage is tracked as a separate effort.
+      files: ^hatchery/core/(protocols|errors)\.py$
+      args:
+        - "--ignore-missing-imports"
+        - "--no-strict-optional"
+        - "--follow-imports=silent"
+      additional_dependencies:
+        - 'pydantic>=2.5.3'
+-   repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+    -   id: bandit
+        args: [
+            '--configfile',
+            'pyproject.toml',
+        ]

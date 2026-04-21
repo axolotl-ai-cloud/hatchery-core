@@ -1,0 +1,184 @@
+---
+title: Open Core Boundary
+description: Understand what belongs in hatchery.core and what belongs in extension packages.
+---
+
+Hatchery is split into:
+
+- `hatchery.core`: open-source local and self-hosted training platform
+- extension packages: production deployment, billing, fleet management
+
+The code boundary is intentionally one-way:
+
+```text
+extensions -> hatchery.core  allowed
+hatchery.core   -> extensions not allowed
+```
+
+## Principle
+
+Core owns capabilities. Extensions own monetization, orchestration, and fleet
+policy.
+
+Examples:
+
+| Capability | Core | Extension |
+| --- | --- | --- |
+| Job processed N tokens | yes | consumes for billing |
+| Token price and invoice line | no | yes |
+| Save/load checkpoint | yes | yes |
+| Checkpoint TTL, public publishing, storage billing | no | yes |
+| Sampling protocol | yes | yes |
+| Production vLLM pool management | no | yes |
+| API-key auth | yes | yes |
+| Enterprise SSO / JWT auth | no | yes |
+| Local queue/object store | yes | no |
+| Production shared-storage backends | no | yes or extension |
+| Local worker | yes | yes |
+| Cloud worker provisioning | no | yes |
+
+## Core Should Contain
+
+- FastAPI gateway
+- worker and trainer
+- native API and Tinker-compatible API
+- protocol definitions
+- local/in-memory backends
+- basic API-key auth
+- local metrics
+- losses and fused loss dispatch
+- model loading and adapter attachment
+- basic checkpoint save/load/list/delete
+- local sampling
+- extension hooks
+
+## Extension Packages Should Contain
+
+- billing
+- pricing
+- prepaid balances
+- payment processing
+- enterprise SSO
+- JWT exchange for SaaS auth
+- internal fleet auth
+- cloud worker provisioning
+- production shared-storage backends
+- production metrics and analytics
+- vLLM production pool management
+- gateway replica registry
+- checkpoint TTL sweeper
+- public checkpoint publishing
+- storage billing
+- cost analysis and quota policy
+
+## Protocols Are The Contract
+
+When a feature needs production infrastructure, keep the contract in core and
+the implementation outside core.
+
+Good:
+
+```text
+core:   ObjectStore protocol
+extension: cloud object store implementation
+```
+
+Good:
+
+```text
+core:   SamplingBackend protocol
+extension: vLLM pool implementation
+```
+
+Avoid:
+
+```text
+core: payment-provider-specific billing logic
+```
+
+Avoid:
+
+```text
+core: SSO-provider-specific auth flow
+```
+
+## Adding A New Feature
+
+Before placing code in `hatchery.core`, ask:
+
+- Is it useful to a local or self-hosted user?
+- Does it work without managed SaaS infrastructure?
+- Is it vendor-neutral?
+- Can an extension supply it through a protocol or plugin instead?
+- Does it force optional dependencies into core imports?
+- Does it expose extension policy as open-core behavior?
+
+If the answer is "no" or "not sure", prefer:
+
+- protocol in core
+- implementation in an extension package
+
+## Examples
+
+### Usage And Billing
+
+Core should emit neutral job metrics:
+
+```json
+{
+  "operation": "forward_backward",
+  "tokens": 1024,
+  "duration_ms": 153.2,
+  "model": "Qwen/Qwen2-0.5B-Instruct"
+}
+```
+
+Extensions should convert that into:
+
+- cost
+- balance holds
+- settlement
+- invoices
+- customer dashboard rows
+
+### Checkpoints
+
+Core should support:
+
+- save checkpoint
+- list checkpoint
+- load checkpoint
+- delete checkpoint
+
+Extensions should support:
+
+- TTLs
+- automatic sweeping
+- public publishing
+- presigned archive URLs
+- storage billing
+
+### Sampling
+
+Core should support:
+
+- sampling protocol
+- local worker sampling
+
+Extensions should support:
+
+- vLLM endpoint pool
+- adapter publishing
+- health checks
+- shared GPU sleep/wake coordination
+- production routing
+
+## Maintenance Checks
+
+Recommended CI checks:
+
+- `hatchery/core/**/*.py` does not import extension packages
+- `hatchery.core` imports cleanly without extension optional dependencies
+- extension routes are not mounted in a plain core app
+- core tests do not require external services or SaaS dependencies
+- docs do not describe extension behavior as core behavior

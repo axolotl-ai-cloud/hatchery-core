@@ -1,0 +1,16 @@
+.idea
+.claude
+*.egg-info
+.env
+.env.*
+!.env.example
+# Ignore Python bytecode
+__pycache__/
+*.pyc
+
+outputs/
+scripts/
+
+# Working docs — not committed. Ignore all markdown by default; opt in with `!`.
+*.md
+!README.md

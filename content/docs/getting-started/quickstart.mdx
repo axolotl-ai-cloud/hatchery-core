@@ -1,0 +1,206 @@
+---
+title: Quickstart
+description: Run the open-core Hatchery gateway, worker, and client locally.
+---
+
+This guide gets the open-core Hatchery stack running locally. It uses only
+`hatchery.core`: FastAPI gateway, in-memory metadata, in-memory queue, local or
+in-memory object storage, API-key auth, and a local worker.
+
+## Requirements
+
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- Optional for real training: CUDA-capable GPU, PyTorch, Transformers, PEFT
+
+The fastest path uses the scripted worker used by the test suite. It does not
+load a real model and is useful for learning the API shape.
+
+## Install
+
+From the repository root:
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e '.[test]'
+```
+
+For real GPU-backed training:
+
+```bash
+uv pip install -e '.[gpu,test]'
+```
+
+## Run The Local Dev Server
+
+```bash
+python -m hatchery.core.local_dev
+```
+
+By default this starts:
+
+- gateway: `http://127.0.0.1:8420`
+- bearer token: `dev-key`
+- in-memory metadata store
+- in-memory queue
+- in-memory object store
+- scripted worker
+
+The launcher prints the active URL, token, and core routes when it starts.
+
+You can also use the helper script:
+
+```bash
+./hatchery/core/scripts/run_local_dev.sh
+```
+
+Common options:
+
+```bash
+PORT=9000 API_KEY=my-dev-key ./hatchery/core/scripts/run_local_dev.sh
+GPU=1 HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct ./hatchery/core/scripts/run_local_dev.sh
+```
+
+## Check Health
+
+```bash
+curl http://127.0.0.1:8420/v1/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+## Use The Native Python Client
+
+```python
+from hatchery.core.client import HatcheryClient
+
+client = HatcheryClient(
+    base_url="http://127.0.0.1:8420",
+    token="dev-key",
+)
+
+training = client.create_lora_training_client(
+    base_model="Qwen/Qwen2-0.5B-Instruct",
+    rank=8,
+)
+
+data = [
+    {
+        "model_input": {
+            "chunks": [
+                {"type": "encoded_text", "tokens": [10, 20, 30, 40]}
+            ]
+        },
+        "loss_fn_inputs": {
+            "target_tokens": {
+                "dtype": "int64",
+                "shape": [4],
+                "data": [10, 20, 30, 40],
+            },
+            "weights": {
+                "dtype": "float32",
+                "shape": [4],
+                "data": [0.0, 1.0, 1.0, 1.0],
+            },
+        },
+    }
+]
+
+fb = training.forward_backward(data)
+print(fb.result(timeout=30))
+
+step = training.optim_step(learning_rate=1e-4)
+print(step.result(timeout=30))
+
+sample = training.sample([10, 20, 30], max_tokens=8)
+print(sample.result(timeout=30))
+
+ckpt = training.save_weights("step-1")
+print(ckpt.result(timeout=30))
+
+client.close()
+```
+
+The local scripted worker returns deterministic fake results. With `GPU=1`,
+the worker loads a real Hugging Face model and executes real training steps.
+
+## Use Curl
+
+Create a native session:
+
+```bash
+curl -sS \
+  -H 'Authorization: Bearer dev-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"base_model":"Qwen/Qwen2-0.5B-Instruct","rank":8}' \
+  http://127.0.0.1:8420/v1/sessions
+```
+
+List sessions:
+
+```bash
+curl -sS \
+  -H 'Authorization: Bearer dev-key' \
+  http://127.0.0.1:8420/v1/sessions
+```
+
+## Use A Real GPU Worker
+
+The local dev launcher can run a real worker in-process:
+
+```bash
+GPU=1 HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct DEVICE=cuda:0 \
+  ./hatchery/core/scripts/run_local_dev.sh
+```
+
+For a separate worker process:
+
+```bash
+export HATCHERY_ADMIN_API_KEY=dev-key
+export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+export HATCHERY_WORKER_DEVICE=cuda:0
+python -m hatchery.core.worker
+```
+
+The standalone worker uses `build_core_config()` unless
+`HATCHERY_CONFIG_FACTORY` is set. In pure core mode, the default queue is
+in-memory, so a separate gateway process will not share jobs with it unless
+you inject a shared backend.
+
+For one-process local work, prefer `python -m hatchery.core.local_dev`.
+
+## Useful Environment Variables
+
+Local dev launcher:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HATCHERY_DEV_PORT` | `8420` | HTTP port |
+| `HATCHERY_DEV_API_KEY` | `dev` | bearer token |
+| `HATCHERY_DEV_BASE_MODEL` | `Qwen/Qwen2-0.5B-Instruct` | HF model id |
+| `HATCHERY_DEV_DEVICE` | auto-detected | torch device |
+| `HATCHERY_DEV_NO_GPU` | `0` | set `1` to force scripted worker even with GPU |
+
+Core config:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HATCHERY_ADMIN_API_KEY` | generated at startup | admin API key for core gateway |
+| `HATCHERY_ADMIN_USER_ID` | `admin` | user id for the admin key |
+| `HATCHERY_OBJECT_STORE` | `local` | `local` or `memory` |
+| `HATCHERY_LOCAL_STORE_PATH` | `/tmp/hatchery_data` | root for local object store |
+| `HATCHERY_BASE_MODEL` | `Qwen/Qwen2-0.5B-Instruct` | worker model |
+| `HATCHERY_WORKER_DEVICE` | `cuda:0` | worker torch device |
+| `HATCHERY_CONFIG_FACTORY` | unset | `module:callable` config factory |
+
+## Next Steps
+
+- Read [Architecture](../learn/architecture) for the data model and operation flow.
+- Read [API endpoints](../reference/endpoints) for native and Tinker-compatible endpoints.
+- Read [Self-hosting](self-hosting) for running the open-core service outside local dev.
+- Read [Extending Hatchery Core](../development/extending) to add new backends or extension features.

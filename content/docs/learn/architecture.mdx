@@ -1,0 +1,257 @@
+---
+title: Architecture
+description: Understand the Hatchery open-core gateway, worker, storage, and operation flow.
+---
+
+Hatchery is an asynchronous training service. Clients submit operations to a
+gateway, the gateway enqueues jobs, and workers execute those jobs against
+long-lived training sessions.
+
+The open-core package is `hatchery.core`. It is designed to run locally or in a
+self-hosted environment without external databases, cloud storage, or a managed
+worker fleet.
+
+## Main Components
+
+### Gateway
+
+File: `hatchery/core/gateway.py`
+
+The gateway is a FastAPI app. It owns:
+
+- HTTP route registration
+- authentication
+- session ownership checks
+- request validation
+- job creation
+- result waiting for synchronous native routes
+- Tinker-compatible API mounting
+- msgpack and compression middleware
+- plugin hook execution
+
+Native routes live under `/v1/*`.
+
+Tinker SDK compatibility routes live under `/api/v1/*`.
+
+### Worker
+
+File: `hatchery/core/worker.py`
+
+The worker:
+
+- polls the `JobQueue`
+- loads or initializes session state
+- activates the requested session/model
+- runs `forward_backward`, `forward_only`, `optim_step`, `sample`, and checkpoint operations
+- persists LoRA/full-parameter state, optimizer state, and gradient accumulation
+- writes job results back to the queue
+
+### Trainer
+
+File: `hatchery/core/trainer.py`
+
+The trainer contains the model-facing training logic. It is responsible for:
+
+- loading base models
+- attaching LoRA adapters
+- handling full-parameter sessions
+- collating training data
+- computing losses
+- stepping optimizer state
+- sampling and logprob computation
+
+### Protocols
+
+File: `hatchery/core/protocols.py`
+
+Core backends are defined by `typing.Protocol`, not by concrete classes.
+This keeps core usable with local backends while allowing extension packages
+to supply production implementations.
+
+Important protocols:
+
+- `AuthProvider`
+- `ObjectStore`
+- `MetadataStore`
+- `JobQueue`
+- `MetricsCollector`
+- `SessionRegistry`
+- `LoraStatePersister`
+- `OptimizerStatePersister`
+
+### Backends
+
+Open core ships simple backends:
+
+- in-memory auth, metadata, queue, object store
+- local filesystem object store
+- logging metrics
+- local compute placeholder
+
+Production-grade backends should live in extension packages or extension packages.
+
+## Core Data Model
+
+### Session
+
+A session is a long-lived training state for one user and one base model.
+
+It records:
+
+- session id
+- owner user id
+- base model
+- LoRA rank or full-parameter mode
+- LoRA target modules
+- step counters
+- status
+- object-store prefix for live state
+- last worker affinity
+
+Only the owning user may operate on a session.
+
+### Job
+
+A job is one operation on a session.
+
+Common operations:
+
+- `init_session`
+- `forward_backward`
+- `forward_only`
+- `optim_step`
+- `sample`
+- `compute_logprobs`
+- `save_weights`
+- `load_weights`
+
+The queue enforces FIFO ordering per session. This is important because the
+worker mutates session state.
+
+### Object Store State
+
+Core session state uses stable object keys:
+
+```text
+sessions/{session_id}/live_state/lora_weights.pt
+sessions/{session_id}/live_state/optimizer_state.pt
+sessions/{session_id}/live_state/grad_accum.pt
+sessions/{session_id}/live_state/session_meta.json
+sessions/{session_id}/checkpoints/{name}/lora_weights.pt
+```
+
+The default open-core persisters write full snapshots. Extension packages may
+replace the persisters with incremental or compressed formats behind the same
+protocol.
+
+## Operation Flow
+
+Native API flow:
+
+```text
+client
+  |
+  | POST /v1/forward_backward
+  v
+gateway
+  |
+  | auth, ownership check, plugin pre-hooks
+  | create JobRecord
+  | enqueue QueuedJob
+  v
+queue
+  |
+  | dequeue
+  v
+worker
+  |
+  | load session state
+  | run operation
+  | persist session state
+  | ack result
+  v
+queue
+  |
+  | wait_for_result
+  v
+gateway
+  |
+  | plugin post-hooks
+  v
+client
+```
+
+Tinker-compatible API flow:
+
+```text
+client
+  |
+  | POST /api/v1/forward_backward
+  v
+gateway
+  |
+  | enqueue job
+  | return request_id
+  v
+client
+  |
+  | POST /api/v1/retrieve_future
+  v
+gateway
+  |
+  | wait for result
+  | wrap result in SDK-compatible response
+  v
+client
+```
+
+## Training Modes
+
+### LoRA
+
+LoRA sessions attach trainable low-rank adapters to a frozen base model.
+This is the default mode when `rank` or `lora_config` is present.
+
+### Full-Parameter
+
+Full-parameter sessions train the model weights directly. In the API this is
+represented by `rank: null` or `lora_config: null`.
+
+## Losses
+
+Loss implementations live in `hatchery/core/losses.py`.
+
+Supported losses include:
+
+- cross entropy
+- PPO-style losses
+- CISPO
+- GRPO
+- DAPO
+- GSPO
+
+Fused cross-entropy paths live in `hatchery/core/fused_losses.py`. They are
+eligibility-gated and fall back to chunked PyTorch logic when unavailable.
+
+## Open Core Boundary
+
+Core should own local and self-hosted capabilities:
+
+- training session lifecycle
+- gateway/worker protocols
+- local queue and object storage
+- basic API-key auth
+- local metrics
+- checkpoint save/load
+
+Extension packages should own:
+
+- billing and pricing
+- payment and SSO integrations
+- production shared-storage backends
+- cloud worker provisioning
+- production sampling pools
+- checkpoint TTL/public publishing
+- multi-replica registry and fleet policy
+
+See [Open Core Boundary](open-core) for the intended boundary.

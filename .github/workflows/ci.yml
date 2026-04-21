@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint (ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install lint tooling
+        run: uv pip install --system -e ".[dev]"
+
+      - name: ruff check
+        run: ruff check hatchery/
+
+      - name: ruff format check
+        run: ruff format --check hatchery/
+
+      - name: mypy
+        run: mypy
+
+  torch-free:
+    name: Torch-free tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install (test extras only)
+        run: uv pip install --system -e ".[test]"
+
+      - name: Run torch-free suite
+        run: |
+          pytest \
+            --ignore=tests/torch_tests \
+            --ignore=tests/test_run_worker_script.py \
+            -q
+
+  cpu:
+    name: CPU tests (torch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install with torch (CPU wheels)
+        env:
+          UV_TORCH_BACKEND: cpu
+        run: |
+          uv pip install --system torch
+          uv pip install --system transformers peft
+          uv pip install --system -e ".[test]"
+
+      - name: Run CPU test suite
+        run: |
+          CUDA_VISIBLE_DEVICES="" pytest \
+            --ignore=tests/torch_tests/test_worker_gpu.py \
+            --ignore=tests/torch_tests/test_multi_gpu_smoke.py \
+            -q
+
+  gpu:
+    name: GPU tests
+    runs-on: axolotl-gpu-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install with GPU extras
+        run: uv pip install --system -e ".[gpu,test]"
+
+      - name: Warm HF cache
+        env:
+          HF_HOME: ${{ runner.temp }}/hf_home
+        run: |
+          python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2-0.5B-Instruct')"
+
+      - name: Run GPU tests
+        env:
+          HF_HOME: ${{ runner.temp }}/hf_home
+          CUDA_VISIBLE_DEVICES: "0"
+          TEST_DEVICE: cuda:0
+        run: pytest tests/torch_tests/ -q --tb=short
