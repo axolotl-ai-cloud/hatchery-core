@@ -22,8 +22,8 @@ Hatchery runs a FastAPI gateway and GPU worker that together expose the Tinker t
 ## Quick start
 
 ```bash
-# Install
-uv pip install -e '.[gpu,test]'
+# Install (includes torch, transformers, peft)
+uv pip install -e '.[test]'
 
 # Start the local dev server (auto-detects GPU)
 python -m hatchery.core.local_dev
