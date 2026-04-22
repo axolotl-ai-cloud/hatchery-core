@@ -22,11 +22,14 @@ Hatchery runs a FastAPI gateway and GPU worker that together expose the Tinker t
 ## Quick start
 
 ```bash
-# Install
+# Install (includes torch, transformers, peft)
 uv pip install -e '.[test]'
 
 # Start the local dev server (auto-detects GPU)
 python -m hatchery.core.local_dev
+
+# Or with a specific model:
+HATCHERY_DEV_BASE_MODEL=meta-llama/Llama-3.1-8B-Instruct python -m hatchery.core.local_dev
 ```
 
 In another terminal:

@@ -25,6 +25,11 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
 
+try:
+    torch.cuda.current_device()
+except RuntimeError as _e:
+    pytest.skip(f"CUDA init failed (driver too old?): {_e}", allow_module_level=True)
+
 pytest.importorskip("peft")
 pytest.importorskip("transformers")
 
