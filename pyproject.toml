@@ -17,7 +17,7 @@ dependencies = [
     "aiosqlite>=0.19",
     "structlog>=24.1",
     "httpx>=0.27",
-    "torch>=2.6",
+    "torch==2.10",
     "transformers>=4.51",
     "peft>=0.10",
 ]
