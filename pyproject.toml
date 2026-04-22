@@ -94,6 +94,8 @@ ignore_missing_imports = true
 check_untyped_defs = false
 files = ["hatchery/core"]
 ignore_errors = true
+explicit_package_bases = true
+mypy_path = "."
 
 [[tool.mypy.overrides]]
 module = [
