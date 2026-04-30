@@ -41,14 +41,13 @@ torch = pytest.importorskip("torch")
 import torch.nn.functional as F  # noqa: E402
 
 from hatchery.core.losses import (  # noqa: E402
-    LossInputs,
     SUPPORTED_LOSS_FNS,
+    LossInputs,
     _log1mexp,
     _new_logprobs_at_targets,
     _orpo,
     compute,
 )
-
 
 # ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -118,9 +117,7 @@ def _reference_orpo(avg_logp: torch.Tensor, orpo_lambda: float) -> torch.Tensor:
     eps = 1e-7
     chosen_clamped = chosen.clamp(max=-eps)
     rejected_clamped = rejected.clamp(max=-eps)
-    log_odds = (chosen - rejected) - (
-        _log1mexp(chosen_clamped) - _log1mexp(rejected_clamped)
-    )
+    log_odds = (chosen - rejected) - (_log1mexp(chosen_clamped) - _log1mexp(rejected_clamped))
     or_loss = -F.logsigmoid(log_odds).mean()
     return sft + orpo_lambda * or_loss
 
@@ -391,9 +388,7 @@ def test_orpo_metrics_carries_required_keys():
 
 
 def test_orpo_lambda_metric_echoes_input():
-    inputs = _make_inputs(
-        B=4, T=8, V=16, seed=404, loss_fn_config={"orpo_lambda": 0.42}
-    )
+    inputs = _make_inputs(B=4, T=8, V=16, seed=404, loss_fn_config={"orpo_lambda": 0.42})
     _, metrics = _orpo(inputs)
     assert metrics["orpo/lambda"] == pytest.approx(0.42)
 

@@ -524,7 +524,7 @@ def _orpo(inputs: LossInputs) -> Any:
     denom = weights.sum(dim=-1).clamp_min(1.0)
     avg_logp = masked.sum(dim=-1) / denom
 
-    chosen = avg_logp[0::2]   # even indices → y_w
+    chosen = avg_logp[0::2]  # even indices → y_w
     rejected = avg_logp[1::2]  # odd indices  → y_l
 
     # 3. SFT term — NLL on the chosen response, length-normalized so
@@ -541,9 +541,7 @@ def _orpo(inputs: LossInputs) -> Any:
     eps = 1e-7
     chosen_clamped = chosen.clamp(max=-eps)
     rejected_clamped = rejected.clamp(max=-eps)
-    log_odds = (chosen - rejected) - (
-        _log1mexp(chosen_clamped) - _log1mexp(rejected_clamped)
-    )
+    log_odds = (chosen - rejected) - (_log1mexp(chosen_clamped) - _log1mexp(rejected_clamped))
     or_loss = -F.logsigmoid(log_odds).mean()
 
     loss = sft_loss + orpo_lambda * or_loss
@@ -560,9 +558,7 @@ def _orpo(inputs: LossInputs) -> Any:
             "orpo/margin": float((chosen - rejected).mean().item()),
             "orpo/chosen_logp": float(chosen.mean().item()),
             "orpo/rejected_logp": float(rejected.mean().item()),
-            "orpo/chosen_reward": float(
-                (orpo_lambda * log_sigmoid_lor).mean().item()
-            ),
+            "orpo/chosen_reward": float((orpo_lambda * log_sigmoid_lor).mean().item()),
             "orpo/lambda": orpo_lambda,
         }
     return loss, metrics
