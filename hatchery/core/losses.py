@@ -71,6 +71,16 @@ Math
     clip (lo=1-3e-4, hi=1+4e-4). Aggregation: per-sequence token
     mean, then batch mean, so long sequences don't dominate.
 
+``orpo``
+    ``L = L_SFT(y_w | x) + λ * (-log σ(log_odds_ratio))``
+    where ``log_odds_ratio = log(odds(y_w|x) / odds(y_l|x))`` and
+    ``odds(y|x) = P(y|x) / (1 - P(y|x))``. ``P(y|x)`` is the
+    *length-normalized* per-token probability of the response.
+    Reference-free preference optimization (arXiv:2403.07691).
+    Batch convention: chosen at even indices, rejected at odd —
+    each adjacent (chosen, rejected) pair shares the same prompt.
+    ``λ`` from ``loss_fn_config["orpo_lambda"]``, default 0.1.
+
 ``dro``
     Not implemented — the exact formulation is not in the public
     Tinker docs. Raises :class:`NotImplementedError` with a clear
@@ -79,6 +89,7 @@ Math
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -201,6 +212,7 @@ SUPPORTED_LOSS_FNS = (
     "grpo",
     "dapo",
     "gspo",
+    "orpo",
 )
 
 # ``dro`` is a declared Tinker type but the exact formulation isn't
@@ -233,6 +245,8 @@ def compute(loss_fn: str, inputs: LossInputs) -> Any:
         return _dapo(inputs)
     if loss_fn == "gspo":
         return _gspo(inputs)
+    if loss_fn == "orpo":
+        return _orpo(inputs)
     if loss_fn == "dro":
         raise LossNotImplementedError(
             "dro is declared by the Tinker API but the exact "
@@ -418,6 +432,146 @@ def _gspo(inputs: LossInputs) -> Any:
     seq_counts = effective.sum(dim=-1).clamp_min(1.0)  # [B]
     seq_means = seq_sums / seq_counts  # [B]
     return seq_means.mean()
+
+
+def _log1mexp(x: Any) -> Any:
+    """Numerically stable ``log(1 - exp(x))`` for ``x <= 0`` (Maechler 2012).
+
+    Switches between ``log1p(-exp(x))`` (better for ``x << 0``) and
+    ``log(-expm1(x))`` (better for ``x`` near 0); the threshold
+    ``x = -ln(2)`` is where the two formulations have equal absolute
+    error. The unselected branch is fed a safe constant so ``torch.where``
+    doesn't propagate NaN gradients from the ``log`` of a non-positive
+    argument.
+    """
+    threshold = -math.log(2.0)
+    safe_far = torch.where(x < threshold, x, torch.full_like(x, threshold - 1.0))
+    safe_near = torch.where(x >= threshold, x, torch.full_like(x, threshold + 1.0))
+    return torch.where(
+        x < threshold,
+        torch.log1p(-torch.exp(safe_far)),
+        torch.log(-torch.expm1(safe_near)),
+    )
+
+
+def _orpo(inputs: LossInputs) -> Any:
+    """ORPO — Odds Ratio Preference Optimization (reference-free).
+
+    Reference: Hong, Lee, Thorne, *ORPO: Monolithic Preference
+    Optimization without Reference Model* (arXiv:2403.07691).
+
+    Wire format conventions
+    -----------------------
+    * **Pair interleaving by index.** Even-index sequences in the
+      batch are chosen (``y_w``); odd-index are rejected (``y_l``).
+      Adjacent rows ``2i`` and ``2i + 1`` share the same prompt.
+      Chosen here over a per-datum ``role`` tag because it matches
+      the canonical client-side reference and the cookbook DPO
+      convention; the only obligation on the gateway is to preserve
+      the row order the client submitted (it does — the Datum list
+      is forwarded unmodified). Validated by an even-batch-size
+      check below.
+    * **λ via ``loss_fn_config["orpo_lambda"]``.** The same channel
+      ``cispo``/``dapo`` use for clip thresholds. Defaults to ``0.1``
+      per the paper's recommendation.
+
+    Math
+    ----
+    With ``P(y|x) = exp((1/m) Σ_t log π(y_t|x, y_<t))`` (length-
+    normalized over the response mask in ``weights``):
+
+        odds(y|x)        = P(y|x) / (1 - P(y|x))
+        log_odds_ratio   = log( odds(y_w|x) / odds(y_l|x) )
+                         = (log p_w - log p_l)
+                           - ( log(1 - p_w) - log(1 - p_l) )
+        L_OR             = -log σ(log_odds_ratio)
+        L_SFT            = -mean(log p_w)        # length-normalized NLL
+        L                = L_SFT + λ * L_OR
+
+    Length normalization is mandatory: without it ``exp(Σ log p)``
+    underflows for non-trivial response lengths and the OR term
+    collapses. ``log(1 - exp(...))`` uses the Maechler 2012 stable
+    formulation in :func:`_log1mexp`.
+
+    Returns ``(loss, metrics)`` rather than a bare scalar — the metrics
+    dict carries the ten ``orpo/*`` diagnostics the SDK surfaces in
+    ``result.metrics``. The worker's ``_compute_loss`` unpacks the
+    tuple and routes the metrics into the JobResult.
+    """
+    cfg = inputs.loss_fn_config or {}
+    orpo_lambda = float(cfg.get("orpo_lambda", 0.1))
+
+    # 1. Per-position logprobs at targets. [B, T]
+    logprobs = _new_logprobs_at_targets(inputs.logits, inputs.target_tokens)
+    weights = inputs.weights
+    if weights is None:
+        # Fall back to the target validity mask so a caller that
+        # didn't supply explicit response weights still gets a sane
+        # length-normalized average over real tokens.
+        valid = inputs.target_tokens.ne(-100)
+        weights = valid.to(logprobs.dtype)
+    else:
+        weights = weights.to(logprobs.dtype)
+
+    if logprobs.shape[0] % 2 != 0:
+        raise ValueError(
+            f"orpo requires an even batch size (chosen at even indices, "
+            f"rejected at odd); got batch size {logprobs.shape[0]}"
+        )
+
+    # 2. Length-normalized response logprob per sequence. [B]
+    masked = logprobs * weights
+    denom = weights.sum(dim=-1).clamp_min(1.0)
+    avg_logp = masked.sum(dim=-1) / denom
+
+    chosen = avg_logp[0::2]   # even indices → y_w
+    rejected = avg_logp[1::2]  # odd indices  → y_l
+
+    # 3. SFT term — NLL on the chosen response, length-normalized so
+    #    it sits on the same scale as L_OR (both are per-token log
+    #    probabilities, not full-sequence sums).
+    sft_loss = -chosen.mean()
+
+    # 4. Odds-ratio term in log space. Clamp the inputs to log(1-p)
+    #    away from 0 so a near-deterministic policy doesn't overflow
+    #    log1p(-exp(0)) = log(0). The clamp is *forward-only*; the
+    #    gradient still flows through the unclamped ``chosen`` /
+    #    ``rejected`` because those drive the SFT term and the
+    #    ``(chosen - rejected)`` part of the log-odds.
+    eps = 1e-7
+    chosen_clamped = chosen.clamp(max=-eps)
+    rejected_clamped = rejected.clamp(max=-eps)
+    log_odds = (chosen - rejected) - (
+        _log1mexp(chosen_clamped) - _log1mexp(rejected_clamped)
+    )
+    or_loss = -F.logsigmoid(log_odds).mean()
+
+    loss = sft_loss + orpo_lambda * or_loss
+
+    # 5. Diagnostics — mirror the client-side reference implementation.
+    with torch.no_grad():
+        log_sigmoid_lor = F.logsigmoid(log_odds)
+        metrics = {
+            "loss": float(loss.detach().item()),
+            "orpo/sft_loss": float(sft_loss.detach().item()),
+            "orpo/or_loss": float(or_loss.detach().item()),
+            "orpo/log_odds_ratio": float(log_odds.mean().item()),
+            "orpo/accuracy": float((chosen > rejected).float().mean().item()),
+            "orpo/margin": float((chosen - rejected).mean().item()),
+            "orpo/chosen_logp": float(chosen.mean().item()),
+            "orpo/rejected_logp": float(rejected.mean().item()),
+            "orpo/chosen_reward": float(
+                (orpo_lambda * log_sigmoid_lor).mean().item()
+            ),
+            "orpo/lambda": orpo_lambda,
+        }
+    return loss, metrics
+
+
+# TODO(perf): no fused-kernel path yet — `fused_losses.py` targets the
+# CE/IS/PPO families that fit the fused-CE shape. ORPO needs full
+# logits materialization for length-normalized response logprobs;
+# revisit if the per-step wall-time becomes a bottleneck.
 
 
 # ─── Helpers for forward_backward_custom ────────────────────────────────
