@@ -69,6 +69,7 @@ def test_supported_loss_fns_covers_all():
         "grpo",
         "dapo",
         "gspo",
+        "orpo",
     }
 
 

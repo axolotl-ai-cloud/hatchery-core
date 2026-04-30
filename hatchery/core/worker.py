@@ -1624,6 +1624,10 @@ class GPUWorker:
                 p.grad = None
 
         per_item_logprobs: Optional[list[list[float]]] = None
+        # Per-call diagnostic metrics from richer losses (e.g. orpo).
+        # Each entry is the metrics dict from one sub-batch; we reduce
+        # by taking the mean across sub-batches when surfacing them.
+        sub_loss_metrics: list[dict] = []
 
         # Fused CE only fits the LoRA path today — the kernel takes a
         # PEFT model and reads adapter-aware metadata. Force the
@@ -1742,7 +1746,7 @@ class GPUWorker:
                     if attention_mask is not None
                     else torch.ones_like(input_ids, dtype=torch.long)
                 )
-                loss = self._compute_loss(
+                loss, loss_metrics = self._compute_loss(
                     logits,
                     labels,
                     loss_mask,
@@ -1752,6 +1756,8 @@ class GPUWorker:
                     advantages=advantages,
                     loss_fn_config=loss_fn_config,
                 )
+                if loss_metrics is not None:
+                    sub_loss_metrics.append(loss_metrics)
                 # Per-datum logprobs path is only reachable on the
                 # single-sub-batch padded route (guard above disables
                 # packing when return_per_datum_logprobs is set).
@@ -1825,10 +1831,21 @@ class GPUWorker:
         }
         if per_item_logprobs is not None:
             result["per_datum_logprobs"] = per_item_logprobs
-        return (
-            result,
-            {"tokens": num_tokens, "cost_dimensions": cost_dims},
-        )
+
+        extra_metrics: dict[str, Any] = {
+            "tokens": num_tokens,
+            "cost_dimensions": cost_dims,
+        }
+        # Mean-reduce loss-fn diagnostics across sub-batches so callers
+        # see a single scalar per metric name (matches the SDK's
+        # ``name:reduction`` envelope conventions; see tinker_compat
+        # _wrap_future_result). Only ever populated by losses that opt
+        # in (currently orpo); the bare-scalar return path leaves
+        # ``sub_loss_metrics`` empty.
+        if sub_loss_metrics:
+            agg = _mean_reduce_loss_metrics(sub_loss_metrics)
+            extra_metrics.update(agg)
+        return (result, extra_metrics)
 
     async def _handle_forward_only(self, session_id: str, payload: dict) -> tuple[dict, dict]:
         """No-grad forward pass with a caller-supplied loss function.
@@ -1865,6 +1882,7 @@ class GPUWorker:
 
         weighted_loss_sum = 0.0
         last_input_ids: Optional[torch.Tensor] = None
+        sub_loss_metrics: list[dict] = []
         for batch, num in zip(sub_batches, sub_token_counts, strict=False):
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = (
@@ -1910,7 +1928,7 @@ class GPUWorker:
                     if attention_mask is not None
                     else torch.ones_like(input_ids, dtype=torch.long)
                 )
-                loss = self._compute_loss(
+                loss, loss_metrics = self._compute_loss(
                     logits,
                     labels,
                     loss_mask,
@@ -1920,6 +1938,8 @@ class GPUWorker:
                     advantages=advantages,
                     loss_fn_config=loss_fn_config,
                 )
+                if loss_metrics is not None:
+                    sub_loss_metrics.append(loss_metrics)
 
             weighted_loss_sum += float(loss.detach().cpu()) * num
             last_input_ids = input_ids
@@ -1935,9 +1955,15 @@ class GPUWorker:
             fused_path=False,
         )
 
+        extra_metrics: dict[str, Any] = {
+            "tokens": num_tokens,
+            "cost_dimensions": cost_dims,
+        }
+        if sub_loss_metrics:
+            extra_metrics.update(_mean_reduce_loss_metrics(sub_loss_metrics))
         return (
             {"loss": loss_val, "num_tokens": num_tokens},
-            {"tokens": num_tokens, "cost_dimensions": cost_dims},
+            extra_metrics,
         )
 
     async def _handle_forward_custom_step1(
@@ -2808,12 +2834,17 @@ class GPUWorker:
         old_logprobs: Optional[torch.Tensor] = None,
         advantages: Optional[torch.Tensor] = None,
         loss_fn_config: Optional[dict] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[dict]]:
         """Dispatch to :mod:`hatchery.core.losses`.
 
         Falls back to an attention-mask-derived weight when the caller
         didn't provide one; that preserves the pre-refactor behavior of
         ``F.cross_entropy(ignore_index=-100)`` for simple SFT paths.
+
+        Returns ``(loss_tensor, extra_metrics)``. Most losses return a
+        bare scalar from :func:`losses.compute`; richer losses (orpo)
+        return ``(scalar, dict)`` so they can surface diagnostic
+        metrics. ``extra_metrics`` is ``None`` for the bare-scalar path.
         """
         from hatchery.core.losses import LossInputs, compute
 
@@ -2829,7 +2860,31 @@ class GPUWorker:
             advantages=advantages,
             loss_fn_config=loss_fn_config,
         )
-        return compute(loss_fn, inputs)
+        result = compute(loss_fn, inputs)
+        if isinstance(result, tuple):
+            return result[0], result[1]
+        return result, None
+
+
+def _mean_reduce_loss_metrics(metrics_list: list[dict]) -> dict:
+    """Mean-reduce per-sub-batch loss metrics into a single flat dict.
+
+    Used by the worker to fold the per-sub-batch diagnostic dicts that
+    a richer loss (e.g. orpo) returns into a single per-call set
+    surfaced via :class:`JobResult.metrics`. Only numeric scalars are
+    averaged; non-numeric entries (if any) are dropped.
+    """
+    if not metrics_list:
+        return {}
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for m in metrics_list:
+        for k, v in m.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            sums[k] = sums.get(k, 0.0) + float(v)
+            counts[k] = counts.get(k, 0) + 1
+    return {k: sums[k] / counts[k] for k in sums}
 
 
 def _move_optimizer_state_to_cpu(state: dict) -> dict:

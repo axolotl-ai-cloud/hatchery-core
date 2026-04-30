@@ -71,9 +71,7 @@ class TestAsampleBypassesIdempotency:
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 called_names.add(node.func.id)
 
-        assert "_future_response" in called_names, (
-            "asample should call _future_response directly"
-        )
+        assert "_future_response" in called_names, "asample should call _future_response directly"
         assert "_idempotent_future_response" not in called_names, (
             "asample must NOT use _idempotent_future_response — "
             "sampling is stochastic and must never return cached results"
