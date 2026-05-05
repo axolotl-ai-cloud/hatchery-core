@@ -7,7 +7,7 @@
 #   NPROC=8 TP_DEGREE=2 CP_DEGREE=2 ./scripts/run_worker.sh  # 8-GPU 2D
 #
 # Environment variables you'll typically want to set:
-#   HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+#   HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B
 #   NPROC=2
 #   HATCHERY_DP_DEGREE=2
 #   HATCHERY_TP_DEGREE=1
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 NPROC="${NPROC:-1}"
-HATCHERY_BASE_MODEL="${HATCHERY_BASE_MODEL:-Qwen/Qwen2-0.5B-Instruct}"
+HATCHERY_BASE_MODEL="${HATCHERY_BASE_MODEL:-Qwen/Qwen2-0.5B}"
 
 # Export the parallelism knobs that ParallelConfig.from_env() reads.
 export HATCHERY_DP_DEGREE="${HATCHERY_DP_DEGREE:-${NPROC}}"

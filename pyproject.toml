@@ -6,8 +6,20 @@ build-backend = "setuptools.build_meta"
 name = "hatchery-core"
 dynamic = ["version"]
 description = "Tinker-compatible LoRA training platform with pluggable backends"
+readme = "README.md"
 requires-python = ">=3.12"
 authors = [{name = "Wing Lian"}]
+license = "Apache-2.0"
+keywords = ["fine-tuning", "lora", "rlhf", "tinker", "training"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "hatchery-client>=0.1.0",
     "fastapi>=0.110",
@@ -23,6 +35,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gpu = []
+examples = [
+    "datasets>=2.20",
+]
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -38,12 +54,24 @@ dev = [
     "types-PyYAML",
 ]
 
+[project.urls]
+Homepage = "https://github.com/axolotl-ai-cloud/hatchery-core"
+Documentation = "https://github.com/axolotl-ai-cloud/hatchery-core/tree/main/content/docs"
+Repository = "https://github.com/axolotl-ai-cloud/hatchery-core"
+Issues = "https://github.com/axolotl-ai-cloud/hatchery-core/issues"
+
+[project.scripts]
+hatchery-local-dev = "hatchery.core.local_dev:main"
+hatchery-worker = "hatchery.core.worker:_main"
+
 [tool.setuptools.dynamic]
 version = {file = "VERSION"}
 
 [tool.setuptools.packages.find]
 include = ["hatchery*"]
-exclude = ["*tests*", "*examples*", "*scripts*"]
+
+[tool.setuptools.package-data]
+"hatchery.core.scripts" = ["*.sh"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

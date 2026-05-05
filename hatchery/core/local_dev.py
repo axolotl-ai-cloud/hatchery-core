@@ -15,7 +15,7 @@ with env vars if needed:
 
   HATCHERY_DEV_PORT        HTTP port (default 8420)
   HATCHERY_DEV_API_KEY     Bearer token (default "dev")
-  HATCHERY_DEV_BASE_MODEL  HF model id (default Qwen/Qwen2-0.5B-Instruct)
+  HATCHERY_DEV_BASE_MODEL  HF model id (default Qwen/Qwen2-0.5B)
   HATCHERY_DEV_DEVICE      Torch device (default: auto-detected)
   HATCHERY_DEV_RANK        Default LoRA rank (default 32)
   HATCHERY_DEV_NO_GPU      Set to "1" to force scripted worker even with GPU
@@ -86,7 +86,7 @@ def _build_config(api_key: str) -> Config:
 async def _serve() -> None:
     port = int(os.environ.get("HATCHERY_DEV_PORT", "8420"))
     api_key = os.environ.get("HATCHERY_DEV_API_KEY", "dev")
-    base_model = os.environ.get("HATCHERY_DEV_BASE_MODEL", "Qwen/Qwen2-0.5B-Instruct")
+    base_model = os.environ.get("HATCHERY_DEV_BASE_MODEL", "Qwen/Qwen2-0.5B")
     device = os.environ.get("HATCHERY_DEV_DEVICE", _auto_device())
     use_gpu = _has_gpu() and device != "cpu"
 

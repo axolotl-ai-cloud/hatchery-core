@@ -135,13 +135,13 @@ async def test_create_session_and_model(compat_client):
         json={
             "session_id": sid,
             "model_seq_id": 0,
-            "base_model": "Qwen/Qwen2-0.5B-Instruct",
+            "base_model": "Qwen/Qwen2-0.5B",
             "lora_config": {"rank": 8},
         },
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["base_model"] == "Qwen/Qwen2-0.5B-Instruct"
+    assert body["base_model"] == "Qwen/Qwen2-0.5B"
     assert body["lora_config"]["rank"] == 8
 
 
@@ -153,13 +153,13 @@ async def test_create_model_full_param(compat_client):
         json={
             "session_id": "tinker-sess-fp",
             "model_seq_id": 0,
-            "base_model": "Qwen/Qwen2-0.5B-Instruct",
+            "base_model": "Qwen/Qwen2-0.5B",
             "lora_config": None,
         },
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["base_model"] == "Qwen/Qwen2-0.5B-Instruct"
+    assert body["base_model"] == "Qwen/Qwen2-0.5B"
     assert body["lora_config"] is None
 
 
@@ -171,7 +171,7 @@ async def test_full_training_loop_via_futures(compat_client):
             json={
                 "session_id": "tinker-sess",
                 "model_seq_id": 0,
-                "base_model": "Qwen/Qwen2-0.5B-Instruct",
+                "base_model": "Qwen/Qwen2-0.5B",
                 "lora_config": {"rank": 8},
             },
         )
@@ -271,7 +271,7 @@ async def test_asample_forwards_seed_and_stop(compat_client):
             json={
                 "session_id": "seed-stop-sess",
                 "model_seq_id": 0,
-                "base_model": "Qwen/Qwen2-0.5B-Instruct",
+                "base_model": "Qwen/Qwen2-0.5B",
                 "lora_config": {"rank": 8},
             },
         )
@@ -396,7 +396,7 @@ async def test_forward_only_returns_loss_without_accum_steps(compat_client):
             json={
                 "session_id": "fo-sess",
                 "model_seq_id": 0,
-                "base_model": "Qwen/Qwen2-0.5B-Instruct",
+                "base_model": "Qwen/Qwen2-0.5B",
                 "lora_config": {"rank": 8},
             },
         )
@@ -649,7 +649,7 @@ async def test_load_weights_cross_user_rejected(compat_client):
             json={
                 "session_id": "sess-cross",
                 "model_seq_id": 0,
-                "base_model": "Qwen/Qwen2-0.5B-Instruct",
+                "base_model": "Qwen/Qwen2-0.5B",
                 "lora_config": {"rank": 8},
             },
         )
@@ -679,7 +679,7 @@ async def test_empty_data_rejected(compat_client):
             json={
                 "session_id": "sess-empty",
                 "model_seq_id": 0,
-                "base_model": "Qwen/Qwen2-0.5B-Instruct",
+                "base_model": "Qwen/Qwen2-0.5B",
                 "lora_config": {"rank": 8},
             },
         )
@@ -704,7 +704,7 @@ async def test_invalid_lora_rank_rejected(compat_client):
         json={
             "session_id": "sess-bad-rank",
             "model_seq_id": 0,
-            "base_model": "Qwen/Qwen2-0.5B-Instruct",
+            "base_model": "Qwen/Qwen2-0.5B",
             "lora_config": {"rank": -5},
         },
     )
@@ -720,7 +720,7 @@ async def test_invalid_temperature_rejected(compat_client):
             json={
                 "session_id": "sess-bad-temp",
                 "model_seq_id": 0,
-                "base_model": "Qwen/Qwen2-0.5B-Instruct",
+                "base_model": "Qwen/Qwen2-0.5B",
                 "lora_config": {"rank": 8},
             },
         )

@@ -24,7 +24,7 @@ Recommended private GPU deployment:
 
 ```bash
 uv pip install -e '.[gpu,test]'
-export HATCHERY_DEV_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+export HATCHERY_DEV_BASE_MODEL=Qwen/Qwen2-0.5B
 export HATCHERY_DEV_DEVICE=cuda:0
 export HATCHERY_DEV_API_KEY=hatchery_change_me
 python -m hatchery.core.local_dev
@@ -49,7 +49,7 @@ Worker:
 
 ```bash
 export HATCHERY_CONFIG_FACTORY='my_package.config:build_config'
-export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B
 python -m hatchery.core.worker
 ```
 

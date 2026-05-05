@@ -42,9 +42,9 @@ async def test_generate_key_roundtrip():
 
 async def test_authorize_model_allowlist():
     auth = APIKeyAuthProvider()
-    auth.add_key("t1", user_id="alice", allowed_models=["Qwen/Qwen2-0.5B-Instruct"])
+    auth.add_key("t1", user_id="alice", allowed_models=["Qwen/Qwen2-0.5B"])
     user = await auth.authenticate("t1")
-    assert await auth.authorize(user, "train", "Qwen/Qwen2-0.5B-Instruct")
+    assert await auth.authorize(user, "train", "Qwen/Qwen2-0.5B")
     assert not await auth.authorize(user, "train", "meta-llama/Llama-3-70B")
 
 

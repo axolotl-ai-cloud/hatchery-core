@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, with or without a leading v"
+        required: true
+        type: string
 
 permissions: {}
 
@@ -18,10 +23,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Resolve release tag
+        id: release
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ github.event.inputs.version }}"
+            version="${version#v}"
+            release_tag="v${version}"
+          else
+            release_tag="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "$release_tag" ] || [ "$release_tag" = "v" ]; then
+            echo "Unable to resolve release tag" >&2
+            exit 1
+          fi
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "${{ steps.release.outputs.release_tag }}" --generate-notes
 
   pypi-publish:
     name: Upload release to PyPI
@@ -46,17 +67,47 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Install build deps
-        run: uv pip install --system build
+        run: uv pip install --system build twine
 
-      - name: Extract tag name
-        id: tag
-        run: echo "TAG_NAME=$(echo $GITHUB_REF | cut -d / -f 3)" >> "$GITHUB_OUTPUT"
-
-      - name: Update VERSION file from tag
-        run: echo "${{ steps.tag.outputs.TAG_NAME }}" | sed 's/^v//' > VERSION
+      - name: Set VERSION from release ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ github.event.inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          version="${version#v}"
+          if [ -z "$version" ]; then
+            echo "Unable to resolve release version" >&2
+            exit 1
+          fi
+          printf '%s\n' "$version" > VERSION
+          echo "Building hatchery-core version $version"
 
       - name: Build package
         run: python -m build
+
+      - name: Check package metadata
+        run: twine check dist/*
+
+      - name: Inspect wheel contents
+        run: |
+          python -m zipfile -l dist/*.whl
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          [wheel] = glob.glob("dist/*.whl")
+          names = set(zipfile.ZipFile(wheel).namelist())
+          required = {
+              "hatchery/core/examples/train_sft.py",
+              "hatchery/core/scripts/run_local_dev.sh",
+              "hatchery/core/scripts/run_worker.sh",
+          }
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(f"missing wheel files: {missing}")
+          PY
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

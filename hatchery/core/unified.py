@@ -128,7 +128,7 @@ def create_unified_app(
 
     from hatchery.core.worker import GPUWorker
 
-    model = base_model or os.environ.get("HATCHERY_BASE_MODEL", "Qwen/Qwen2-0.5B-Instruct")
+    model = base_model or os.environ.get("HATCHERY_BASE_MODEL", "Qwen/Qwen2-0.5B")
     config = build_unified_config(persistent=persistent, root=root)
     set_config(config)
 

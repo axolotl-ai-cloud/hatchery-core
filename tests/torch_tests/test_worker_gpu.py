@@ -2,14 +2,14 @@
 # Copyright (c) Axolotl AI
 # Licensed under the Apache License, Version 2.0
 
-"""GPU integration test with a real Qwen2-0.5B-Instruct base model.
+"""GPU integration test with a real Qwen2-0.5B base model.
 
 Runs end-to-end through the worker with a real LoRA, doing a handful
 of forward/backward + optim_step cycles on a synthetic overfit batch
 and confirming that loss decreases.
 
 Skipped automatically if CUDA isn't available, and also skipped if the
-user has not pre-loaded (or cannot download) Qwen2-0.5B-Instruct.
+user has not pre-loaded (or cannot download) Qwen2-0.5B.
 
 Parametrized on dtype: fp16 runs everywhere, bf16 only on Ampere+.
 """
@@ -34,7 +34,7 @@ pytest.importorskip("peft")
 pytest.importorskip("transformers")
 
 
-MODEL_NAME = os.environ.get("TEST_BASE_MODEL", "Qwen/Qwen2-0.5B-Instruct")
+MODEL_NAME = os.environ.get("TEST_BASE_MODEL", "Qwen/Qwen2-0.5B")
 TEST_DEVICE = os.environ.get("TEST_DEVICE", "cuda:0")
 
 _DTYPES = [torch.float16]

@@ -59,7 +59,7 @@ Request:
 {
   "session_id": "my-session",
   "model_seq_id": 0,
-  "base_model": "Qwen/Qwen2-0.5B-Instruct",
+  "base_model": "Qwen/Qwen2-0.5B",
   "lora_config": {"rank": 32}
 }
 ```
@@ -228,7 +228,7 @@ The `HatcheryClient` in `hatchery.core.client` provides the same interface:
 from hatchery.core.client import HatcheryClient
 
 client = HatcheryClient(base_url="http://localhost:8765", token="...")
-tc = client.create_lora_training_client("Qwen/Qwen2-0.5B-Instruct", rank=32)
+tc = client.create_lora_training_client("Qwen/Qwen2-0.5B", rank=32)
 tc.forward_backward([datum]).result()
 tc.optim_step(learning_rate=1e-4).result()
 tc.save_weights("checkpoint-1")

@@ -12,9 +12,12 @@ in-memory object storage, API-key auth, and a local worker.
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 - Optional for real training: CUDA-capable GPU, PyTorch, Transformers, PEFT
+- Optional for cookbooks: Hugging Face dataset access
 
-The fastest path uses the scripted worker used by the test suite. It does not
-load a real model and is useful for learning the API shape.
+On a machine with CUDA, the local dev launcher auto-detects the GPU and loads
+a real worker. On CPU-only machines, it falls back to the scripted worker used
+by the test suite; that path is useful for learning the API shape without
+loading a real model.
 
 ## Install
 
@@ -23,13 +26,13 @@ From the repository root:
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install -e '.[test]'
+uv pip install -e '.[test,examples]'
 ```
 
 For real GPU-backed training:
 
 ```bash
-uv pip install -e '.[gpu,test]'
+uv pip install -e '.[gpu,test,examples]'
 ```
 
 ## Run The Local Dev Server
@@ -41,11 +44,11 @@ python -m hatchery.core.local_dev
 By default this starts:
 
 - gateway: `http://127.0.0.1:8420`
-- bearer token: `dev-key`
+- bearer token: `dev`
 - in-memory metadata store
 - in-memory queue
 - in-memory object store
-- scripted worker
+- GPU worker when CUDA is available, otherwise scripted worker
 
 The launcher prints the active URL, token, and core routes when it starts.
 
@@ -59,7 +62,7 @@ Common options:
 
 ```bash
 PORT=9000 API_KEY=my-dev-key ./hatchery/core/scripts/run_local_dev.sh
-GPU=1 HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct ./hatchery/core/scripts/run_local_dev.sh
+GPU=1 BASE_MODEL=Qwen/Qwen2-0.5B ./hatchery/core/scripts/run_local_dev.sh
 ```
 
 ## Check Health
@@ -81,11 +84,11 @@ from hatchery.core.client import HatcheryClient
 
 client = HatcheryClient(
     base_url="http://127.0.0.1:8420",
-    token="dev-key",
+    token="dev",
 )
 
 training = client.create_lora_training_client(
-    base_model="Qwen/Qwen2-0.5B-Instruct",
+    base_model="Qwen/Qwen2-0.5B",
     rank=8,
 )
 
@@ -100,12 +103,12 @@ data = [
             "target_tokens": {
                 "dtype": "int64",
                 "shape": [4],
-                "data": [10, 20, 30, 40],
+                "data": [20, 30, 40, 50],
             },
             "weights": {
                 "dtype": "float32",
                 "shape": [4],
-                "data": [0.0, 1.0, 1.0, 1.0],
+                "data": [1.0, 1.0, 1.0, 1.0],
             },
         },
     }
@@ -129,15 +132,47 @@ client.close()
 The local scripted worker returns deterministic fake results. With `GPU=1`,
 the worker loads a real Hugging Face model and executes real training steps.
 
+Hatchery follows the Tinker convention for causal language-model training:
+`model_input` is right-shifted and `target_tokens` are left-shifted. For a full
+token sequence `[10, 20, 30, 40, 50]`, send `[10, 20, 30, 40]` as model input
+and `[20, 30, 40, 50]` as targets. For prompt/completion data, apply prompt
+masking after this shift.
+
+## Run A Cookbook
+
+The Pig Latin example trains a pretrained base model while borrowing the
+matching instruction model's tokenizer/chat template:
+
+```bash
+python -m hatchery.core.examples.train_sft \
+  --base-url http://127.0.0.1:8420 \
+  --token dev \
+  --base-model Qwen/Qwen2-0.5B \
+  --steps 100 \
+  --rl-steps 0 \
+  --batch-size 2
+```
+
+For a small style-transfer smoke test:
+
+```bash
+python -m hatchery.core.examples.train_pirate_style \
+  --base-url http://127.0.0.1:8420 \
+  --token dev \
+  --base-model Qwen/Qwen2-0.5B \
+  --steps 100 \
+  --batch-size 2
+```
+
 ## Use Curl
 
 Create a native session:
 
 ```bash
 curl -sS \
-  -H 'Authorization: Bearer dev-key' \
+  -H 'Authorization: Bearer dev' \
   -H 'Content-Type: application/json' \
-  -d '{"base_model":"Qwen/Qwen2-0.5B-Instruct","rank":8}' \
+  -d '{"base_model":"Qwen/Qwen2-0.5B","rank":8}' \
   http://127.0.0.1:8420/v1/sessions
 ```
 
@@ -145,7 +180,7 @@ List sessions:
 
 ```bash
 curl -sS \
-  -H 'Authorization: Bearer dev-key' \
+  -H 'Authorization: Bearer dev' \
   http://127.0.0.1:8420/v1/sessions
 ```
 
@@ -154,15 +189,15 @@ curl -sS \
 The local dev launcher can run a real worker in-process:
 
 ```bash
-GPU=1 HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct DEVICE=cuda:0 \
+GPU=1 BASE_MODEL=Qwen/Qwen2-0.5B DEVICE=cuda:0 \
   ./hatchery/core/scripts/run_local_dev.sh
 ```
 
 For a separate worker process:
 
 ```bash
-export HATCHERY_ADMIN_API_KEY=dev-key
-export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+export HATCHERY_ADMIN_API_KEY=dev
+export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B
 export HATCHERY_WORKER_DEVICE=cuda:0
 python -m hatchery.core.worker
 ```
@@ -182,7 +217,7 @@ Local dev launcher:
 | --- | --- | --- |
 | `HATCHERY_DEV_PORT` | `8420` | HTTP port |
 | `HATCHERY_DEV_API_KEY` | `dev` | bearer token |
-| `HATCHERY_DEV_BASE_MODEL` | `Qwen/Qwen2-0.5B-Instruct` | HF model id |
+| `HATCHERY_DEV_BASE_MODEL` | `Qwen/Qwen2-0.5B` | HF model id |
 | `HATCHERY_DEV_DEVICE` | auto-detected | torch device |
 | `HATCHERY_DEV_NO_GPU` | `0` | set `1` to force scripted worker even with GPU |
 
@@ -194,7 +229,7 @@ Core config:
 | `HATCHERY_ADMIN_USER_ID` | `admin` | user id for the admin key |
 | `HATCHERY_OBJECT_STORE` | `local` | `local` or `memory` |
 | `HATCHERY_LOCAL_STORE_PATH` | `/tmp/hatchery_data` | root for local object store |
-| `HATCHERY_BASE_MODEL` | `Qwen/Qwen2-0.5B-Instruct` | worker model |
+| `HATCHERY_BASE_MODEL` | `Qwen/Qwen2-0.5B` | worker model |
 | `HATCHERY_WORKER_DEVICE` | `cuda:0` | worker torch device |
 | `HATCHERY_CONFIG_FACTORY` | unset | `module:callable` config factory |
 

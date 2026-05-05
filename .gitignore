@@ -10,7 +10,17 @@ __pycache__/
 
 outputs/
 scripts/
+!hatchery/core/scripts/
+!hatchery/core/scripts/**
+build/
+dist/
 
 # Working docs — not committed. Ignore all markdown by default; opt in with `!`.
 *.md
 !README.md
+!CHANGELOG.md
+!CODE_OF_CONDUCT.md
+!CONTRIBUTING.md
+!RELEASE.md
+!SECURITY.md
+!.github/**/*.md
