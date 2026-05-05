@@ -2946,7 +2946,7 @@ async def run_worker_from_env() -> None:
     await config.queue.initialize()
     logger.info("worker.boot.queue_initialized")
 
-    base = os.environ.get("HATCHERY_BASE_MODEL", "Qwen/Qwen2-0.5B-Instruct")
+    base = os.environ.get("HATCHERY_BASE_MODEL", "Qwen/Qwen2-0.5B")
     device = os.environ.get("HATCHERY_WORKER_DEVICE", "cuda:0")
     worker = GPUWorker(
         worker_id=f"worker-{uuid.uuid4().hex[:8]}",

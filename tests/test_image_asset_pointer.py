@@ -350,7 +350,7 @@ async def test_forward_backward_with_image_asset_pointer(capturing_client, monke
             json={
                 "session_id": "tinker-sess",
                 "model_seq_id": 0,
-                "base_model": "Qwen/Qwen2-0.5B-Instruct",
+                "base_model": "Qwen/Qwen2-0.5B",
                 "lora_config": {"rank": 8},
             },
         )

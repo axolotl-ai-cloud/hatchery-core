@@ -44,7 +44,7 @@ def _sample_session(session_id="s1", user_id="u1"):
     return SessionRecord(
         session_id=session_id,
         user_id=user_id,
-        base_model="Qwen/Qwen2-0.5B-Instruct",
+        base_model="Qwen/Qwen2-0.5B",
         lora_rank=16,
         lora_alpha=32,
         target_modules=["q_proj", "v_proj"],

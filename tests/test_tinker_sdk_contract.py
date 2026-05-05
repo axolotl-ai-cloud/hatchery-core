@@ -158,7 +158,7 @@ async def _create_model(client, rank=8):
         json={
             "session_id": "contract-sess",
             "model_seq_id": 0,
-            "base_model": "Qwen/Qwen2-0.5B-Instruct",
+            "base_model": "Qwen/Qwen2-0.5B",
             "lora_config": {"rank": rank},
         },
     )
@@ -177,7 +177,7 @@ async def test_create_model_returns_untyped_api_future(sdk_client):
         json={
             "session_id": "s",
             "model_seq_id": 0,
-            "base_model": "Qwen/Qwen2-0.5B-Instruct",
+            "base_model": "Qwen/Qwen2-0.5B",
             "lora_config": {"rank": 8},
         },
     )

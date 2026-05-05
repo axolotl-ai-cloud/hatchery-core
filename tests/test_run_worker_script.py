@@ -129,12 +129,12 @@ def _has_gpu() -> bool:
 def _has_qwen_cached() -> bool:
     # Best-effort check for the model under HF cache.
     cache = Path.home() / ".cache" / "huggingface" / "hub"
-    return any(cache.glob("models--Qwen--Qwen2-0.5B-Instruct*"))
+    return any(cache.glob("models--Qwen--Qwen2-0.5B*"))
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_gpu(), reason="need a CUDA device")
-@pytest.mark.skipif(not _has_qwen_cached(), reason="Qwen2-0.5B-Instruct not in HF cache")
+@pytest.mark.skipif(not _has_qwen_cached(), reason="Qwen2-0.5B not in HF cache")
 def test_run_worker_sh_subprocess_roundtrip(tmp_path):
     """Run the actual ``./core/scripts/run_worker.sh NPROC=1`` subprocess
     against an in-process gateway. Enqueue an init_session + one
@@ -156,7 +156,7 @@ def test_run_worker_sh_subprocess_roundtrip(tmp_path):
     env.update(
         {
             "NPROC": "1",
-            "HATCHERY_BASE_MODEL": "Qwen/Qwen2-0.5B-Instruct",
+            "HATCHERY_BASE_MODEL": "Qwen/Qwen2-0.5B",
             "HATCHERY_WORKER_DEVICE": device,
             # Point the worker at hosted's env-var-driven config factory
             # so it wires up SQLite metadata/queue and the S3/local
@@ -189,7 +189,7 @@ def test_run_worker_sh_subprocess_roundtrip(tmp_path):
         session_id = f"sub-{uuid.uuid4().hex[:8]}"
         init_payload = msgpack.packb(
             {
-                "base_model": "Qwen/Qwen2-0.5B-Instruct",
+                "base_model": "Qwen/Qwen2-0.5B",
                 "rank": 4,
                 "lora_alpha": 8,
                 "target_modules": ["q_proj", "v_proj"],
@@ -204,7 +204,7 @@ def test_run_worker_sh_subprocess_roundtrip(tmp_path):
                 operation="init_session",
                 payload=init_payload,
                 priority=10,
-                required_model="Qwen/Qwen2-0.5B-Instruct",
+                required_model="Qwen/Qwen2-0.5B",
                 user_id="test",
             )
         )
@@ -224,7 +224,7 @@ def test_run_worker_sh_subprocess_roundtrip(tmp_path):
                 operation="forward_backward",
                 payload=fb_payload,
                 priority=0,
-                required_model="Qwen/Qwen2-0.5B-Instruct",
+                required_model="Qwen/Qwen2-0.5B",
                 user_id="test",
             )
         )

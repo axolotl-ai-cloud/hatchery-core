@@ -4,8 +4,10 @@
 
 """SFT + GRPO on WikiText pig-latin: end-to-end fine-tuning and RL.
 
-Phase 1 (SFT): Fine-tunes a model to translate English → pig-latin
-using sentences from WikiText-2 with the tokenizer's chat template.
+Phase 1 (SFT): Fine-tunes a pretrained base model to translate English →
+pig-latin using sentences from WikiText-2. The tokenizer can come from a
+matching chat model so examples still use the chat format without training
+an instruction-tuned base model.
 
 Phase 2 (GRPO): Samples 4 completions per prompt, scores them with
 a character-level reward (edit-distance to the correct pig-latin),
@@ -84,30 +86,57 @@ def load_wikitext_sentences(max_examples: int = 200) -> list[str]:
     return sentences
 
 
-def tokenize_example(tok, phrase: str) -> dict:
+def default_tokenizer_model(base_model: str) -> str:
+    if base_model.endswith("-Base"):
+        return base_model.removesuffix("-Base")
+    if base_model == "Qwen/Qwen2-0.5B":
+        return "Qwen/Qwen2-0.5B-Instruct"
+    return base_model
+
+
+def _apply_chat_template(tok, messages: list[dict[str, str]], **kwargs) -> str:
+    return tok.apply_chat_template(messages, tokenize=False, **kwargs)
+
+
+def shifted_completion_labels(full_ids: list[int], prompt_len: int) -> tuple[list[int], list[int]]:
+    input_ids = full_ids[:-1]
+    labels = [-100] * max(prompt_len - 1, 0) + full_ids[prompt_len:]
+    if len(labels) != len(input_ids):
+        raise ValueError("shifted labels must align with input ids")
+    return input_ids, labels
+
+
+def tokenize_example(tok, phrase: str, *, enable_reasoning: bool = False) -> dict:
     target = piglatinize(phrase)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": phrase},
         {"role": "assistant", "content": target},
     ]
-    full_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    full_text = _apply_chat_template(
+        tok,
+        messages,
+        add_generation_prompt=False,
+        enable_thinking=enable_reasoning,
+    )
     full_ids = tok.encode(full_text, add_special_tokens=False)
 
     prompt_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": phrase},
     ]
-    prompt_text = tok.apply_chat_template(
-        prompt_messages, tokenize=False, add_generation_prompt=True
+    prompt_text = _apply_chat_template(
+        tok,
+        prompt_messages,
+        add_generation_prompt=True,
+        enable_thinking=enable_reasoning,
     )
     prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
 
-    labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids) :]
-    assert len(labels) == len(full_ids)
+    input_ids, labels = shifted_completion_labels(full_ids, len(prompt_ids))
     return {
         "model_input": {
-            "chunks": [{"type": "encoded_text", "tokens": list(full_ids)}],
+            "chunks": [{"type": "encoded_text", "tokens": list(input_ids)}],
         },
         "loss_fn_inputs": {
             "target_tokens": {"data": list(labels), "shape": [len(labels)]},
@@ -161,7 +190,12 @@ def main() -> int:
         "--base-url", default=os.environ.get("HATCHERY_BASE_URL", "http://127.0.0.1:8420")
     )
     parser.add_argument("--token", default=os.environ.get("HATCHERY_API_KEY", "dev"))
-    parser.add_argument("--base-model", default="Qwen/Qwen2-0.5B-Instruct")
+    parser.add_argument("--base-model", default="Qwen/Qwen2-0.5B")
+    parser.add_argument(
+        "--tokenizer-model",
+        default=None,
+        help="Tokenizer/chat-template model. Defaults to a matching chat model for known base models.",
+    )
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--sft-epochs", type=int, default=3)
@@ -172,13 +206,19 @@ def main() -> int:
     parser.add_argument("--kl-beta", type=float, default=0.04)
     parser.add_argument("--n-samples", type=int, default=16)
     parser.add_argument("--sample-temp", type=float, default=0.4)
+    parser.add_argument(
+        "--enable-reasoning",
+        action="store_true",
+        help="Allow thinking/reasoning tokens in chat templates for models that support them.",
+    )
     parser.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
     parser.add_argument("--wandb-project", default="hatchery-piglatin")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(args.base_model)
+    tokenizer_model = args.tokenizer_model or default_tokenizer_model(args.base_model)
+    tok = AutoTokenizer.from_pretrained(tokenizer_model)
 
     # W&B setup.
     run = None
@@ -189,6 +229,7 @@ def main() -> int:
             project=args.wandb_project,
             config={
                 "base_model": args.base_model,
+                "tokenizer_model": tokenizer_model,
                 "rank": args.rank,
                 "sft_steps": args.steps,
                 "sft_epochs": args.sft_epochs,
@@ -199,6 +240,7 @@ def main() -> int:
                 "kl_beta": args.kl_beta,
                 "n_samples": args.n_samples,
                 "sample_temp": args.sample_temp,
+                "enable_reasoning": args.enable_reasoning,
             },
         )
 
@@ -209,8 +251,11 @@ def main() -> int:
     )
     print(f"  {len(all_sentences)} sentences extracted")
 
-    train_data = [tokenize_example(tok, s) for s in all_sentences]
+    train_data = [
+        tokenize_example(tok, s, enable_reasoning=args.enable_reasoning) for s in all_sentences
+    ]
     print(f"\ndataset: {len(train_data)} examples (chat-template formatted)")
+    print(f"  tokenizer_model: {tokenizer_model}")
     print(f"  eos_token: {tok.eos_token!r}")
 
     client = HatcheryClient(base_url=args.base_url, token=args.token, timeout=300)
@@ -280,8 +325,11 @@ def main() -> int:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": phrase},
                 ]
-                prompt_text = tok.apply_chat_template(
-                    prompt_messages, tokenize=False, add_generation_prompt=True
+                prompt_text = _apply_chat_template(
+                    tok,
+                    prompt_messages,
+                    add_generation_prompt=True,
+                    enable_thinking=args.enable_reasoning,
                 )
                 prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
 
@@ -321,19 +369,22 @@ def main() -> int:
                 # 2d. Build GRPO training data for each completion.
                 for seq, old_lp, adv in zip(token_seqs, logprob_seqs, advantages, strict=False):
                     full_ids = list(prompt_ids) + list(seq)
-                    labels = [-100] * len(prompt_ids) + list(seq)
+                    input_ids, labels = shifted_completion_labels(full_ids, len(prompt_ids))
 
                     comp_len = len(seq)
                     if len(old_lp) < comp_len:
                         old_lp = list(old_lp) + [0.0] * (comp_len - len(old_lp))
                     old_lp = old_lp[:comp_len]
-                    padded_old_lp = [0.0] * len(prompt_ids) + list(old_lp)
-                    adv_per_token = [0.0] * len(prompt_ids) + [adv] * comp_len
+                    padded_old_lp = [0.0] * max(len(prompt_ids) - 1, 0) + list(old_lp)
+                    adv_per_token = [0.0] * max(len(prompt_ids) - 1, 0) + [adv] * comp_len
+                    assert len(labels) == len(input_ids)
+                    assert len(padded_old_lp) == len(input_ids)
+                    assert len(adv_per_token) == len(input_ids)
 
                     all_grpo_data.append(
                         {
                             "model_input": {
-                                "chunks": [{"type": "encoded_text", "tokens": full_ids}],
+                                "chunks": [{"type": "encoded_text", "tokens": input_ids}],
                             },
                             "loss_fn_inputs": {
                                 "target_tokens": {"data": labels, "shape": [len(labels)]},
@@ -396,8 +447,11 @@ def main() -> int:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": phrase},
             ]
-            prompt_text = tok.apply_chat_template(
-                prompt_messages, tokenize=False, add_generation_prompt=True
+            prompt_text = _apply_chat_template(
+                tok,
+                prompt_messages,
+                add_generation_prompt=True,
+                enable_thinking=args.enable_reasoning,
             )
             prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
             result = tc.sample(
@@ -424,11 +478,8 @@ def main() -> int:
             run.finish()
         return 0
     finally:
-        from hatchery.core.client import _BackgroundLoop
-
-        fut = _BackgroundLoop.get().submit(client.aclose())
         with contextlib.suppress(Exception):
-            fut.result(timeout=5)
+            client.close()
 
 
 if __name__ == "__main__":

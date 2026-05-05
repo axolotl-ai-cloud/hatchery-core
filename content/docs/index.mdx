@@ -3,14 +3,35 @@ title: Hatchery Open Core
 description: Learn, run, self-host, and extend the open-core Hatchery training platform.
 ---
 
-Hatchery is an asynchronous post-training API for LoRA fine-tuning and reinforcement-learning workflows. The open-core package gives you the gateway, worker, trainer, local storage backends, API-key auth, native HTTP API, and Tinker-compatible routes needed to run locally or self-host.
+Hatchery Core is an open-source, Tinker-compatible runtime for fine-tuning and post-training language models on infrastructure you control. It gives you a local or self-hosted gateway, GPU worker, LoRA trainer, checkpoint store, local storage backends, API-key auth, native HTTP API, and Tinker-compatible routes.
+
+Use it to prototype SFT, RL-style objectives, custom losses, and sampling recipes locally, then carry the same API shape into a self-hosted deployment with pluggable queue, storage, auth, and worker backends.
 
 ## Start Here
 
-- [Quickstart](getting-started/quickstart): run the local gateway and worker.
+- [Quickstart](getting-started/quickstart): run the local gateway, worker, client, and cookbooks.
 - [Architecture](learn/architecture): understand the control plane, worker, storage, and job flow.
 - [API endpoints](reference/endpoints): use the native and Tinker-compatible HTTP surfaces.
 - [Self-hosting](getting-started/self-hosting): run open core outside the local dev launcher.
+
+For enterprise or self-hosted deployment questions, or if you need help adapting Hatchery to a sensitive workflow, contact `contact@axolotl.ai`.
+
+## Known Limitations
+
+- The default local launcher is a development path, not a production scheduler.
+- Multi-worker deployments need shared queue, metadata, and object-store backends supplied through configuration or extension packages.
+- GPU behavior depends on the installed PyTorch build, CUDA drivers, model architecture, and VRAM.
+- The included cookbooks are validation and experimentation launchpads, not fully tuned recipes for every model family.
+- Multi-modal paths exist in core, but release validation is still primarily text-only.
+
+## Roadmap
+
+- Incorporate optimized Axolotl training patches and kernels where they improve throughput, memory use, or model-family coverage.
+- Expand multi-modal validation for VLM training, sampling, and checkpoint flows.
+- Harden distributed and multi-worker self-hosting patterns with shared queue and object-store backends.
+- Add more end-to-end cookbooks for SFT, RL, style-transfer, and custom-loss workflows.
+- Improve observability around loss, token throughput, queue latency, GPU memory, and checkpoint operations.
+- Stabilize the public API and configuration surface for a non-alpha release.
 
 ## Project Shape
 

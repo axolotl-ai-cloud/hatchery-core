@@ -106,7 +106,7 @@ you need multiple processes.
 Single GPU:
 
 ```bash
-export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct
+export HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B
 export HATCHERY_WORKER_DEVICE=cuda:0
 python -m hatchery.core.worker
 ```
@@ -114,7 +114,7 @@ python -m hatchery.core.worker
 Script helper:
 
 ```bash
-HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct ./hatchery/core/scripts/run_worker.sh
+HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B ./hatchery/core/scripts/run_worker.sh
 ```
 
 Multi-process torchrun:
@@ -144,7 +144,7 @@ from hatchery.core.backends.metrics.log import LogMetrics
 
 def build_config() -> Config:
     auth = APIKeyAuthProvider()
-    auth.add_key("dev-key", user_id="admin", max_concurrent_sessions=100, max_rank=256)
+    auth.add_key("dev", user_id="admin", max_concurrent_sessions=100, max_rank=256)
 
     metadata = ...
     queue = ...

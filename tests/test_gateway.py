@@ -141,7 +141,7 @@ async def test_create_session_flow(gateway_client):
     client, worker, _ = gateway_client
     resp = await client.post(
         "/v1/sessions",
-        json={"base_model": "Qwen/Qwen2-0.5B-Instruct", "rank": 16},
+        json={"base_model": "Qwen/Qwen2-0.5B", "rank": 16},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -151,7 +151,7 @@ async def test_create_session_flow(gateway_client):
     # Subsequent get/list should reflect the session.
     resp = await client.get(f"/v1/sessions/{sid}")
     assert resp.status_code == 200
-    assert resp.json()["base_model"] == "Qwen/Qwen2-0.5B-Instruct"
+    assert resp.json()["base_model"] == "Qwen/Qwen2-0.5B"
 
     resp = await client.get("/v1/sessions")
     assert resp.status_code == 200
