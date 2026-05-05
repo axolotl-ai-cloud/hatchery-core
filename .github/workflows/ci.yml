@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, master]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
 
 jobs:
@@ -154,7 +154,7 @@ jobs:
         env:
           HF_HOME: ${{ runner.temp }}/hf_home
         run: |
-          python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2-0.5B-Instruct')"
+          python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2-0.5B')"
 
       - name: Run GPU tests
         env:
