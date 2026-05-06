@@ -46,6 +46,7 @@ from hatchery.core.batching import (
     prepare_batch_for_dp,
 )
 from hatchery.core.config import Config
+from hatchery.core.distributed import DistributedRuntime, init_distributed_runtime
 from hatchery.core.optim_dispatch import (
     build_optimizer,
     select_optimizer_kind,
@@ -71,6 +72,27 @@ from hatchery.core.model_pool import (  # noqa: E402, F401
     _get_vision_token_ids,
     _is_vlm_model,
 )
+
+
+class _DistributedCommandBus:
+    """Thin wrapper around torch.distributed collectives used by GPUWorker."""
+
+    def __init__(self, runtime: DistributedRuntime) -> None:
+        self.runtime = runtime
+
+    def broadcast(self, value: Any) -> Any:
+        import torch.distributed as dist
+
+        box = [value]
+        dist.broadcast_object_list(box, 0)
+        return box[0]
+
+    def gather_errors(self, error: Optional[str]) -> list[Optional[str]]:
+        import torch.distributed as dist
+
+        gathered: list[Optional[str]] = [None for _ in range(self.runtime.world_size)]
+        dist.all_gather_object(gathered, error)
+        return gathered
 
 
 def _strip_vision_tokens(input_ids: list[int], vision_ids: set[int]) -> list[int]:
@@ -159,6 +181,17 @@ class GPUWorker:
         self.attn_implementation = attn_implementation
         self.parallel = parallel or ParallelConfig()
         self.running = True
+        self._distributed_runtime = DistributedRuntime(
+            global_rank=0,
+            local_rank=0,
+            dp_rank=0,
+            world_size=1,
+            dp_world_size=1,
+            device=None,
+        )
+        self._command_bus: Optional[_DistributedCommandBus] = None
+        self._mesh = None
+        self._distributed_runtime_initialized = False
 
         self._raw_base: Any = None
         self._peft: Optional[PeftModel] = None
@@ -192,6 +225,9 @@ class GPUWorker:
         # whichever slot is currently routed.
         self._fp_base_state: dict[str, dict[str, torch.Tensor]] = {}
 
+        if load_model:
+            self._init_distributed_runtime()
+
         # Two-tier session state store: fast local disk for hot-path
         # mutations, asynchronous mirror to the configured remote store.
         # See hatchery/core/session_store.py for the invariants.
@@ -201,7 +237,12 @@ class GPUWorker:
             ensure_local_root,
         )
 
-        local_root = ensure_local_root(default_local_root(worker_id))
+        local_root_path = default_local_root(worker_id)
+        if self._is_distributed and not self._is_rank0:
+            local_root_path = os.path.join(
+                local_root_path, f"rank-{self._distributed_runtime.global_rank}"
+            )
+        local_root = ensure_local_root(local_root_path)
         # The session store binds both a local cache (hot path) and an
         # optional remote mirror. Core ships a local-only variant; the
         # Extension packages can override ``Config.build_session_store``
@@ -226,23 +267,34 @@ class GPUWorker:
         self._on_start_hooks: list[Any] = []
         self._pre_load_session_hooks: list[Any] = []
 
+    @property
+    def _is_distributed(self) -> bool:
+        return self._distributed_runtime.is_distributed
+
+    @property
+    def _is_rank0(self) -> bool:
+        return self._distributed_runtime.global_rank == 0
+
+    def _persists_external_state(self) -> bool:
+        return not self._is_distributed or self._is_rank0
+
+    def _init_distributed_runtime(self) -> None:
+        if self._distributed_runtime_initialized:
+            return
+        self._distributed_runtime = init_distributed_runtime(self.parallel)
+        self._mesh = self._distributed_runtime.mesh
+        if self._distributed_runtime.device is not None:
+            self.device = str(self._distributed_runtime.device)
+        if self._distributed_runtime.is_distributed:
+            self._command_bus = _DistributedCommandBus(self._distributed_runtime)
+        self._distributed_runtime_initialized = True
+
     # ── Model loading ─────────────────────────────────────────
 
     def _load_base_model(self) -> None:
         logger.info("worker.loading_model", model=self.base_model_name, device=self.device)
 
-        if self.parallel.is_distributed():
-            # Distributed helpers are contributed by an extension package
-            # via hatchery.core.parallel_hooks. Only reachable when dp/tp/cp
-            # > 1, which requires a multi-GPU deploy with the extension
-            # installed.
-            from hatchery.core.parallel_hooks import get_distributed_helpers
-
-            helpers = get_distributed_helpers()
-            helpers.init_distributed_if_needed(self.parallel)
-            self._mesh = helpers.build_device_mesh(self.parallel)
-        else:
-            self._mesh = None
+        self._init_distributed_runtime()
 
         # Delegate base-model / tokenizer / VLM processor loading to
         # the pool. With max_vram_slots=1 (the default) this is
@@ -312,6 +364,8 @@ class GPUWorker:
     # ── Registration / lifecycle ──────────────────────────────
 
     async def register(self) -> None:
+        if not self._persists_external_state():
+            return
         info = WorkerInfo(
             worker_id=self.worker_id,
             provider="local",
@@ -330,6 +384,8 @@ class GPUWorker:
             await register(info)
 
     async def heartbeat(self, status: str = "idle") -> None:
+        if not self._persists_external_state():
+            return
         heartbeat = getattr(self.config.compute, "heartbeat", None)
         if heartbeat is not None:
             await heartbeat(
@@ -380,15 +436,15 @@ class GPUWorker:
                     "worker.on_start_hook_failed",
                     worker_id=self.worker_id,
                 )
-        if self.parallel.is_distributed():
-            import torch.distributed as dist
-
-            if dist.is_initialized() and dist.get_world_size() > 1:
-                if dist.get_rank() == 0:
-                    await self._run_coordinator(max_jobs=max_jobs)
-                else:
-                    await self._run_follower(max_jobs=max_jobs)
-                return
+        if self._is_distributed:
+            self._command_bus = self._command_bus or _DistributedCommandBus(
+                self._distributed_runtime
+            )
+            if self._is_rank0:
+                await self._run_coordinator(max_jobs=max_jobs)
+            else:
+                await self._run_follower(max_jobs=max_jobs)
+            return
 
         processed = 0
         idle_polls = 0
@@ -461,25 +517,45 @@ class GPUWorker:
         shows up as "Duplicate GPU detected". The broadcasts are tiny
         (a few KB), so briefly blocking the loop is fine.
         """
-        import torch.distributed as dist
-
+        if not self._persists_external_state():
+            return
+        bus = self._command_bus or _DistributedCommandBus(self._distributed_runtime)
         processed = 0
         while self.running:
             if max_jobs is not None and processed >= max_jobs:
-                dist.broadcast_object_list([None], 0)
+                bus.broadcast({"type": "shutdown"})
                 break
 
-            job = await self.config.queue.dequeue(
-                worker_id=self.worker_id,
-                model_filter=self.base_model_name,
-                visibility_timeout=300,
-            )
+            try:
+                job = await self.config.queue.dequeue(
+                    worker_id=self.worker_id,
+                    model_filter=self.base_model_name,
+                    visibility_timeout=300,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "worker.dequeue.error",
+                    worker_id=self.worker_id,
+                    err=f"{type(exc).__name__}: {exc}",
+                )
+                bus.broadcast({"type": "idle"})
+                await asyncio.sleep(2.0)
+                continue
             if job is None:
-                dist.broadcast_object_list([None], 0)
+                bus.broadcast({"type": "idle"})
                 await asyncio.sleep(0.05)
+                continue
+            if job.required_cp_degree > self.parallel.cp_degree:
+                bus.broadcast({"type": "idle"})
+                await self.config.queue.nack(
+                    job.job_id,
+                    f"Worker cp_degree={self.parallel.cp_degree}, "
+                    f"job requires {job.required_cp_degree}",
+                )
                 continue
 
             signal = {
+                "type": "job",
                 "job_id": job.job_id,
                 "session_id": job.session_id,
                 "operation": job.operation,
@@ -487,9 +563,24 @@ class GPUWorker:
                 "user_id": job.user_id,
                 "preferred_worker": job.preferred_worker,
                 "required_model": job.required_model,
+                "required_cp_degree": job.required_cp_degree,
             }
-            dist.broadcast_object_list([signal], 0)
-            await self._process_one(job)
+            bus.broadcast(signal)
+            t0 = time.time()
+            result: Optional[JobResult] = None
+            local_error: Optional[str] = None
+            try:
+                result = await self._execute_job(job)
+            except Exception as exc:  # noqa: BLE001
+                local_error = self._format_job_error(exc)
+            gathered = bus.gather_errors(local_error)
+            collective_error = next((err for err in gathered if err), None)
+            if collective_error is not None:
+                await self._nack_failed_job(job, collective_error)
+            elif result is not None and result.status == JobStatus.COMPLETED:
+                await self._ack_completed_job(job, result, t0)
+            elif result is not None:
+                await self.config.queue.ack(job.job_id, result)
             processed += 1
 
     async def _run_follower(self, *, max_jobs: Optional[int]) -> None:
@@ -500,17 +591,14 @@ class GPUWorker:
         rank so FSDP's forward/backward collectives stay balanced. We
         never touch the queue and never ack — rank 0 owns that.
         """
-        import torch.distributed as dist
-
+        bus = self._command_bus or _DistributedCommandBus(self._distributed_runtime)
         processed = 0
         while self.running:
-            recv = [None]
-            dist.broadcast_object_list(recv, 0)
-            data = recv[0]
-            if data is None:
-                if max_jobs is not None and processed >= max_jobs:
-                    break
+            data = bus.broadcast(None)
+            if data is None or data.get("type") == "idle":
                 continue
+            if data.get("type") == "shutdown":
+                break
             fake_job = QueuedJob(
                 job_id=data["job_id"],
                 session_id=data["session_id"],
@@ -519,7 +607,9 @@ class GPUWorker:
                 user_id=data.get("user_id"),
                 preferred_worker=data.get("preferred_worker"),
                 required_model=data.get("required_model"),
+                required_cp_degree=data.get("required_cp_degree", 1),
             )
+            local_error: Optional[str] = None
             try:
                 # Don't ack/nack — rank 0 handles that. We only need to
                 # run the forward/backward so our FSDP collectives
@@ -527,19 +617,16 @@ class GPUWorker:
                 # lock acquire here — ``_execute_job`` already holds
                 # ``_model_lock``, and asyncio.Lock is not reentrant.
                 await self._execute_job(fake_job)
-            except Exception:  # noqa: BLE001
-                # Asymmetric errors here are a known hazard: if rank 0
-                # throws after broadcasting and we don't, the next
-                # broadcast will deadlock. We swallow to give rank 0
-                # a chance to report the error back via nack, but
-                # production code should run with torch error-on-desync.
+            except Exception as exc:  # noqa: BLE001
+                local_error = self._format_job_error(exc)
                 logger.exception("follower.execute_failed", job_id=fake_job.job_id)
+            bus.gather_errors(local_error)
             processed += 1
-            if max_jobs is not None and processed >= max_jobs:
-                break
 
     async def process_next(self, timeout: float = 1.0) -> bool:
         """Process a single queued job. Returns ``True`` if one was handled."""
+        if self._is_distributed and not self._is_rank0:
+            return False
         deadline = time.time() + timeout
         while time.time() < deadline:
             job = await self.config.queue.dequeue(
@@ -557,49 +644,66 @@ class GPUWorker:
         t0 = time.time()
         try:
             result = await self._execute_job(job)
-            # Grad-accum hard-pin management must happen *before* ack so
-            # no peer can race in and dequeue the next job for this
-            # session between our ack and our pin set. Ops that leave
-            # grad_accum live on local disk pin the session; optim_step
-            # (which drains it) clears.
             if result.status == JobStatus.COMPLETED:
-                await self._update_accum_pin(job)
-            await self.config.queue.ack(job.job_id, result)
-            duration_ms = (time.time() - t0) * 1000
-            self.cadence.record(job.session_id, job.operation, duration_ms)
-            with contextlib.suppress(KeyError):
-                await self.config.metadata.update_session(
-                    job.session_id,
-                    last_worker_id=self.worker_id,
-                    avg_step_duration_ms=self.cadence.avg_duration_ms(job.session_id),
-                )
-            # Update session registry for fast preferred_worker lookups.
-            # ``session_registry`` is an extension-provided field (e.g.
-            # a Redis-backed store); the core Config doesn't carry it,
-            # so use getattr with a None default.
-            session_registry = getattr(self.config, "session_registry", None)
-            if session_registry is not None:
-                with contextlib.suppress(Exception):
-                    await session_registry.set(job.session_id, self.worker_id)
-            metrics = result.metrics or {}
-            self.config.metrics.record_job_duration(
-                session_id=job.session_id,
-                user_id=job.user_id or "",
-                operation=job.operation,
-                duration_ms=duration_ms,
-                tokens=metrics.get("tokens", 0),
-                worker_id=self.worker_id,
-                gpu_type=self._gpu_label(),
-                cost_dimensions=metrics.get("cost_dimensions"),
-            )
+                await self._ack_completed_job(job, result, t0)
+            else:
+                await self.config.queue.ack(job.job_id, result)
         except Exception as exc:  # noqa: BLE001
             logger.exception("worker.job_failed", job_id=job.job_id)
-            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__, limit=30))
-            await self.config.queue.nack(job.job_id, f"{type(exc).__name__}: {exc}\n{tb}")
-            self.config.metrics.increment_counter(
-                "job_failures",
-                {"operation": job.operation, "error_type": type(exc).__name__},
+            await self._nack_failed_job(job, self._format_job_error(exc))
+
+    def _format_job_error(self, exc: BaseException) -> str:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__, limit=30))
+        return f"{type(exc).__name__}: {exc}\n{tb}"
+
+    async def _ack_completed_job(self, job: QueuedJob, result: JobResult, t0: float) -> None:
+        if not self._persists_external_state():
+            return
+        # Grad-accum hard-pin management must happen *before* ack so
+        # no peer can race in and dequeue the next job for this
+        # session between our ack and our pin set. Ops that leave
+        # grad_accum live on local disk pin the session; optim_step
+        # (which drains it) clears.
+        await self._update_accum_pin(job)
+        await self.config.queue.ack(job.job_id, result)
+        duration_ms = (time.time() - t0) * 1000
+        self.cadence.record(job.session_id, job.operation, duration_ms)
+        with contextlib.suppress(KeyError):
+            await self.config.metadata.update_session(
+                job.session_id,
+                last_worker_id=self.worker_id,
+                avg_step_duration_ms=self.cadence.avg_duration_ms(job.session_id),
             )
+        # Update session registry for fast preferred_worker lookups.
+        # ``session_registry`` is an extension-provided field (e.g.
+        # a Redis-backed store); the core Config doesn't carry it,
+        # so use getattr with a None default.
+        session_registry = getattr(self.config, "session_registry", None)
+        if session_registry is not None:
+            with contextlib.suppress(Exception):
+                await session_registry.set(job.session_id, self.worker_id)
+        metrics = result.metrics or {}
+        self.config.metrics.record_job_duration(
+            session_id=job.session_id,
+            user_id=job.user_id or "",
+            operation=job.operation,
+            duration_ms=duration_ms,
+            tokens=metrics.get("tokens", 0),
+            worker_id=self.worker_id,
+            gpu_type=self._gpu_label(),
+            cost_dimensions=metrics.get("cost_dimensions"),
+        )
+
+    async def _nack_failed_job(self, job: QueuedJob, error: str) -> None:
+        if not self._persists_external_state():
+            return
+        await self.config.queue.nack(job.job_id, error)
+        first_line = error.splitlines()[0] if error else "unknown"
+        error_type = first_line.split(":", 1)[0] if ":" in first_line else first_line
+        self.config.metrics.increment_counter(
+            "job_failures",
+            {"operation": job.operation, "error_type": error_type},
+        )
 
     _ACCUM_PINNING_OPS = frozenset({"forward_backward", "forward_custom_step2"})
 
@@ -905,7 +1009,7 @@ class GPUWorker:
         # claim this session. We can't await from a sync callback, so
         # schedule a flush task; worker shutdown drain is the safety
         # net if the pod dies before this completes.
-        if self._state.has_pending(session_id):
+        if self._persists_external_state() and self._state.has_pending(session_id):
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
@@ -1269,7 +1373,14 @@ class GPUWorker:
                 self._slot.parallel_applied = True
 
     def _apply_parallel_plan(self) -> None:
-        if self._peft is None or self._mesh is None:
+        if self._peft is None:
+            return
+        extension = self._distributed_runtime.extension_handle
+        apply_plan = getattr(extension, "apply_parallel_plan", None)
+        if callable(apply_plan):
+            apply_plan(self._peft, self._distributed_runtime, self.parallel)
+            return
+        if self._mesh is None:
             return
         from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard
 
@@ -1433,15 +1544,17 @@ class GPUWorker:
         # the same worker can skip the _is_cache_stale GET — the
         # object store is authoritative-for-others, but *we* just
         # wrote the latest meta, so there's nothing newer out there.
-        self._self_saved_versions[session_id] = (
-            runtime.meta.get("total_steps", 0),
-            runtime.meta.get("accum_steps", 0),
-        )
+        if self._persists_external_state():
+            self._self_saved_versions[session_id] = (
+                runtime.meta.get("total_steps", 0),
+                runtime.meta.get("accum_steps", 0),
+            )
 
         # ── Phase 2: schedule (or await) remote mirror ──────────────
-        self._state.mark_dirty(session_id)
+        if self._persists_external_state():
+            self._state.mark_dirty(session_id)
         remote_ms = 0.0
-        if sync_remote:
+        if sync_remote and self._persists_external_state():
             t_remote = time.time()
             await self._state.flush(session_id)
             remote_ms = (time.time() - t_remote) * 1000
@@ -1481,8 +1594,9 @@ class GPUWorker:
         meta["fp_pristine_init"] = True  # load path uses this to reconstruct from HF
         payload = json.dumps(meta).encode("utf-8")
         await self._state.local.put(f"{prefix}/session_meta.json", payload)
-        self._state.mark_dirty(session_id)
-        await self._state.flush(session_id)
+        if self._persists_external_state():
+            self._state.mark_dirty(session_id)
+            await self._state.flush(session_id)
 
     # ── Operation handlers ────────────────────────────────────
 
@@ -1553,15 +1667,7 @@ class GPUWorker:
         to :func:`prepare_batch_for_dp` with the strategy configured
         on ``self.parallel``.
         """
-        if not self.parallel.is_distributed() or self.parallel.dp_degree <= 1:
-            return list(data_items)
-        try:
-            import torch.distributed as dist  # noqa: PLC0415
-
-            if not dist.is_initialized():
-                return list(data_items)
-            rank = dist.get_rank()
-        except Exception:  # noqa: BLE001
+        if not self._is_distributed or self._distributed_runtime.dp_world_size <= 1:
             return list(data_items)
 
         try:
@@ -1571,8 +1677,8 @@ class GPUWorker:
 
         allocation = prepare_batch_for_dp(
             data_items,
-            dp_degree=self.parallel.dp_degree,
-            rank=rank,
+            dp_degree=self._distributed_runtime.dp_world_size,
+            rank=self._distributed_runtime.dp_rank,
             strategy=strategy,
         )
         # Emit a metric so operators can see how much compute is being
@@ -1811,10 +1917,11 @@ class GPUWorker:
         )
         await self._save_session_to_store(session_id, runtime)
 
-        with contextlib.suppress(KeyError):
-            await self.config.metadata.update_session(
-                session_id, accum_steps=runtime.meta["accum_steps"]
-            )
+        if self._persists_external_state():
+            with contextlib.suppress(KeyError):
+                await self.config.metadata.update_session(
+                    session_id, accum_steps=runtime.meta["accum_steps"]
+                )
 
         cost_dims = self._build_cost_dimensions(
             runtime=runtime,
@@ -2124,10 +2231,11 @@ class GPUWorker:
             del cache[custom_id]
         await self._save_session_to_store(session_id, runtime)
 
-        with contextlib.suppress(KeyError):
-            await self.config.metadata.update_session(
-                session_id, accum_steps=runtime.meta["accum_steps"]
-            )
+        if self._persists_external_state():
+            with contextlib.suppress(KeyError):
+                await self.config.metadata.update_session(
+                    session_id, accum_steps=runtime.meta["accum_steps"]
+                )
 
         num_tokens = int((labels != -100).sum().cpu())
         return (
@@ -2236,12 +2344,13 @@ class GPUWorker:
 
         await self._save_session_to_store(session_id, runtime)
 
-        with contextlib.suppress(KeyError):
-            await self.config.metadata.update_session(
-                session_id,
-                total_steps=runtime.meta["total_steps"],
-                accum_steps=0,
-            )
+        if self._persists_external_state():
+            with contextlib.suppress(KeyError):
+                await self.config.metadata.update_session(
+                    session_id,
+                    total_steps=runtime.meta["total_steps"],
+                    accum_steps=0,
+                )
 
         return (
             {
@@ -2260,6 +2369,8 @@ class GPUWorker:
             raise RuntimeError(f"session {session_id} not loaded on this worker")
 
         await self._save_session_to_store(session_id, runtime, sync_remote=True)
+        if not self._persists_external_state():
+            return {"path": f"tinker://{session_id}/checkpoints/{name}"}, {}
 
         src_prefix = f"{self.config.sessions_prefix}/{session_id}/live_state"
         dst_prefix = f"{self.config.sessions_prefix}/{session_id}/checkpoints/{name}"

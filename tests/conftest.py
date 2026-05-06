@@ -12,21 +12,27 @@ raises IndexError when ``is_available()`` and ``device_count()`` disagree.
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
 
-import pytest
-import pytest_asyncio
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from hatchery.core.backends.auth.api_key import APIKeyAuthProvider
-from hatchery.core.backends.compute.local import LocalComputeBackend
-from hatchery.core.backends.metadata.memory import InMemoryMetadataStore
-from hatchery.core.backends.metrics.log import LogMetrics
-from hatchery.core.backends.object_store.local import LocalObjectStore
-from hatchery.core.backends.object_store.memory import InMemoryObjectStore
-from hatchery.core.backends.queue.memory import InMemoryJobQueue
-from hatchery.core.config import Config
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+
+from hatchery.core.backends.auth.api_key import APIKeyAuthProvider  # noqa: E402
+from hatchery.core.backends.compute.local import LocalComputeBackend  # noqa: E402
+from hatchery.core.backends.metadata.memory import InMemoryMetadataStore  # noqa: E402
+from hatchery.core.backends.metrics.log import LogMetrics  # noqa: E402
+from hatchery.core.backends.object_store.local import LocalObjectStore  # noqa: E402
+from hatchery.core.backends.object_store.memory import InMemoryObjectStore  # noqa: E402
+from hatchery.core.backends.queue.memory import InMemoryJobQueue  # noqa: E402
+from hatchery.core.config import Config  # noqa: E402
 
 
 @pytest_asyncio.fixture
