@@ -55,6 +55,7 @@ jobs:
         run: |
           pytest \
             --ignore=tests/torch_tests \
+            --ignore=tests/torch_distributed \
             --ignore=tests/test_run_worker_script.py \
             -q
 
@@ -84,7 +85,7 @@ jobs:
         run: |
           CUDA_VISIBLE_DEVICES="" pytest \
             --ignore=tests/torch_tests/test_worker_gpu.py \
-            --ignore=tests/torch_tests/test_multi_gpu_smoke.py \
+            --ignore=tests/torch_distributed \
             -q
 
   package:
@@ -161,4 +162,4 @@ jobs:
           HF_HOME: ${{ runner.temp }}/hf_home
           CUDA_VISIBLE_DEVICES: "0"
           TEST_DEVICE: cuda:0
-        run: pytest tests/torch_tests/ -q --tb=short
+        run: pytest tests/torch_tests/ tests/torch_distributed/ -q --tb=short

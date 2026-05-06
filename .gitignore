@@ -12,6 +12,8 @@ outputs/
 scripts/
 !hatchery/core/scripts/
 !hatchery/core/scripts/**
+!tests/torch_distributed/scripts/
+!tests/torch_distributed/scripts/**
 build/
 dist/
 
