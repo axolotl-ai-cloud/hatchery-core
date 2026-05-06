@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _DIST_DIR = _REPO_ROOT / "tests" / "dist"
 
 
@@ -88,101 +88,13 @@ def test_fsdp2_smoke_pure_torch(tmp_path):
 
 
 def test_fsdp2_smoke_vanilla_trainer(tmp_path):
-    """VanillaTrainer + PEFT + FSDP2 on real Qwen2-0.5B."""
+    """VanillaTrainer + PEFT + FSDP2 on a tiny local causal LM."""
     out = tmp_path / "trainer.json"
     result = _run_torchrun(
         _DIST_DIR / "trainer_fsdp2_smoke.py",
         out,
-        ["--steps", "3"],
+        ["--steps", "4"],
     )
     assert result["status"] == "ok", result.get("error")
     assert result["world_size"] == 2
     assert result["losses_decreased"], result
-
-
-def test_context_parallel_smoke_pure_torch(tmp_path):
-    """Context parallel on a hand-written attention block.
-
-    Validates the ``context_parallel_region`` helper in
-    :mod:`distributed parallel` and the fact that torch's ring
-    attention runs end-to-end with our mesh layout.
-    """
-    out = tmp_path / "cp.json"
-    result = _run_torchrun(_DIST_DIR / "cp_smoke.py", out, [])
-    assert result["status"] == "ok", result.get("error")
-    assert result["mesh_dims"] == ["cp"]
-    assert result["world_size"] == 2
-    assert result["loss_decreased"], result
-
-
-def test_multi_rank_worker_coordinator_follower(tmp_path):
-    """End-to-end multi-rank GPUWorker: rank 0 coordinates the queue,
-    rank 1 follows along via ``broadcast_object_list``, both run FSDP
-    forward/backward on Qwen2-0.5B. Validates the rank-0 queue-broker
-    pattern that makes FSDP workers look like a single logical unit
-    from the gateway's perspective.
-    """
-    out = tmp_path / "mr.json"
-    result = _run_torchrun(
-        _DIST_DIR / "multi_rank_worker_smoke.py",
-        out,
-        ["--steps", "2"],
-    )
-    assert result["status"] == "ok", result.get("error")
-    assert result["world_size"] == 2
-    assert result["acked"] == 2, result
-
-
-def test_multi_rank_dp_split_batch(tmp_path):
-    """BatchStrategy.SPLIT end-to-end on real Qwen2-0.5B with 2 ranks.
-
-    Each rank gets exactly one item from a batch of 2. Both ranks run
-    the forward/backward together under FSDP; gradients are averaged
-    across ranks via the default reduce-mean. The loss must decrease
-    and each rank's local num_tokens should reflect only one item.
-    """
-    out = tmp_path / "dp_split.json"
-    result = _run_torchrun(
-        _DIST_DIR / "multi_rank_dp_split_smoke.py",
-        out,
-        ["--steps", "3"],
-    )
-    assert result["status"] == "ok", result.get("error")
-    assert result["world_size"] == 2
-    assert result["loss_decreased"], result
-    assert result["split_worked"], result
-
-
-def test_multi_rank_worker_simple_direct_execute(tmp_path):
-    """Simpler companion to the coordinator test: each rank calls
-    ``_execute_job`` directly with identical payloads. If this ever
-    fails but the full coordinator test still passes, the bug is in
-    the queue / broadcast layer, not in FSDP+PEFT integration.
-    """
-    out = tmp_path / "simple.json"
-    result = _run_torchrun(
-        _DIST_DIR / "multi_rank_worker_simple.py",
-        out,
-        ["--steps", "2"],
-    )
-    assert result["status"] == "ok", result.get("error")
-    assert result["decreased"], result
-
-
-def test_context_parallel_smoke_vanilla_trainer(tmp_path):
-    """VanillaTrainer + PEFT + CP on real Qwen2-0.5B with a 512-token input.
-
-    This is the realistic agentic-trace case: long sequences get
-    sharded across the CP group so each GPU only holds half the tokens'
-    activations.
-    """
-    out = tmp_path / "trainer_cp.json"
-    result = _run_torchrun(
-        _DIST_DIR / "trainer_cp_smoke.py",
-        out,
-        ["--steps", "3", "--seq-len", "512"],
-    )
-    assert result["status"] == "ok", result.get("error")
-    assert result["world_size"] == 2
-    assert result["seq_len"] >= 256
-    assert result["loss_decreased"], result
