@@ -136,6 +136,7 @@ def apply_core_fsdp2_dp(model: Any, runtime: DistributedRuntime, config: Paralle
 
     for block in layers:
         fully_shard(block, **fsdp_kwargs)
+    fully_shard(model, **fsdp_kwargs)
 
 
 def _is_core_dp_only(config: ParallelConfig) -> bool:

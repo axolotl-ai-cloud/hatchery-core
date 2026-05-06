@@ -13,6 +13,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from transformers import AutoTokenizer
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from hatchery.core.distributed import destroy_distributed_runtime
@@ -63,6 +64,38 @@ def _build_trainer() -> VanillaTrainer:
     return trainer
 
 
+def _build_hf_trainer(base_model: str) -> VanillaTrainer:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = f"cuda:{local_rank}"
+    return VanillaTrainer(
+        base_model_name=base_model,
+        device=device,
+        dtype=torch.bfloat16,
+        attn_implementation="eager",
+        parallel=ParallelConfig(dp_degree=2, batch_strategy="replicate"),
+    )
+
+
+def _build_data(base_model: str | None) -> list[dict]:
+    if base_model is None:
+        return [
+            {"input_ids": [2, 3, 4, 5, 6, 7, 8, 9], "labels": [2, 3, 4, 5, 6, 7, 8, 9]},
+            {"input_ids": [9, 8, 7, 6, 5, 4, 3, 2], "labels": [9, 8, 7, 6, 5, 4, 3, 2]},
+        ]
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    prompts = [
+        "Hatchery trains adapters with data parallel FSDP.",
+        "A small validation batch should reduce loss after optimizer steps.",
+    ]
+    data = []
+    for prompt in prompts:
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+        ids = ids[:32]
+        data.append({"input_ids": ids, "labels": ids})
+    return data
+
+
 def _mean_loss(loss: float) -> float:
     local_rank = int(os.environ["LOCAL_RANK"])
     tensor = torch.tensor(float(loss), device=f"cuda:{local_rank}")
@@ -75,20 +108,23 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--base-model", default=None)
     args = parser.parse_args()
 
     trainer = None
     try:
         torch.cuda.manual_seed_all(11)
-        trainer = _build_trainer()
-        spec = LoraSpec(rank=4, lora_alpha=8, target_modules=["c_attn"])
+        trainer = _build_hf_trainer(args.base_model) if args.base_model else _build_trainer()
+        target_modules = (
+            ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+            if args.base_model
+            else ["c_attn"]
+        )
+        spec = LoraSpec(rank=4, lora_alpha=8, target_modules=target_modules)
         state = trainer.init_session_state("fsdp2-smoke", spec)
         trainer.load_state("fsdp2-smoke", state)
 
-        data = [
-            {"input_ids": [2, 3, 4, 5, 6, 7, 8, 9], "labels": [2, 3, 4, 5, 6, 7, 8, 9]},
-            {"input_ids": [9, 8, 7, 6, 5, 4, 3, 2], "labels": [9, 8, 7, 6, 5, 4, 3, 2]},
-        ]
+        data = _build_data(args.base_model)
         losses: list[float] = []
         for _ in range(args.steps):
             result = trainer.forward_backward("fsdp2-smoke", data, "cross_entropy")
@@ -96,7 +132,7 @@ def main() -> None:
             trainer.optim_step(
                 "fsdp2-smoke",
                 {
-                    "learning_rate": 5e-2,
+                    "learning_rate": 1e-2,
                     "beta1": 0.9,
                     "beta2": 0.95,
                     "eps": 1e-8,

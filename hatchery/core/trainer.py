@@ -470,6 +470,8 @@ class VanillaTrainer:
         defined relative to the pristine base, so any drift from
         prior full-param training must be undone first.
         """
+        if self._distributed_runtime.is_core_dp_only and self._parallel_applied:
+            return
         if self._pristine_base_sd is None:
             return
         self._load_base_sd_into_live(self._pristine_base_sd)

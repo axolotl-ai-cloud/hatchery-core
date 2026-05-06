@@ -1401,6 +1401,7 @@ class GPUWorker:
 
         for block in inner:
             fully_shard(block, **kwargs)
+        fully_shard(self._peft, **kwargs)
 
     async def _save_session_to_store(
         self,

@@ -270,6 +270,7 @@ def test_apply_core_fsdp2_dp_wraps_discovered_layers(monkeypatch):
     assert calls == [
         (layers[0], {"mesh": "dp-mesh"}),
         (layers[1], {"mesh": "dp-mesh"}),
+        (model, {"mesh": "dp-mesh"}),
     ]
 
 
