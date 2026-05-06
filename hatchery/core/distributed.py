@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -110,6 +111,55 @@ def destroy_distributed_runtime(runtime: Optional[DistributedRuntime] = None) ->
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
+
+
+def iter_decoder_layers(model: Any) -> Iterable[Any]:
+    """Yield decoder blocks from supported HF/PEFT causal-LM layouts."""
+    paths = (
+        ("base_model", "model", "model", "layers"),
+        ("base_model", "model", "transformer", "h"),
+        ("model", "model", "layers"),
+        ("model", "transformer", "h"),
+        ("transformer", "h"),
+    )
+    for path in paths:
+        node = model
+        for attr in path:
+            node = getattr(node, attr, None)
+            if node is None:
+                break
+        if node is not None:
+            yield from node
+            return
+
+
+def apply_core_fsdp2_dp(
+    model: Any, runtime: DistributedRuntime, config: ParallelConfig
+) -> None:
+    """Apply core-owned FSDP2 DP wrapping to decoder layers."""
+    if not runtime.is_core_dp_only:
+        raise RuntimeError(
+            "apply_core_fsdp2_dp requires a core DP-only runtime; "
+            f"got {runtime.extension_name!r}."
+        )
+    if runtime.dp_mesh is None:
+        raise RuntimeError("Core FSDP2 DP runtime is missing a dp_mesh.")
+
+    from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard
+
+    fsdp_kwargs: dict[str, Any] = {"mesh": runtime.dp_mesh}
+    if config.offload.cpu_offload_params:
+        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
+
+    layers = list(iter_decoder_layers(model))
+    if not layers:
+        raise RuntimeError(
+            "Core FSDP2 DP could not discover decoder layers to shard. "
+            "Unsupported model layout for core DP-only FSDP2."
+        )
+
+    for block in layers:
+        fully_shard(block, **fsdp_kwargs)
 
 
 def _is_core_dp_only(config: ParallelConfig) -> bool:

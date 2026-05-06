@@ -76,6 +76,7 @@ include = ["hatchery*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
     "gpu: tests that require a real CUDA device",
 ]

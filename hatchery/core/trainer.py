@@ -34,6 +34,10 @@ import contextlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, Protocol
 
+from hatchery.core.distributed import (
+    apply_core_fsdp2_dp,
+    init_distributed_runtime,
+)
 from hatchery.core.parallel import ParallelConfig
 
 # Torch is an optional dependency. The gateway, scripted test trainer,
@@ -210,9 +214,9 @@ class VanillaTrainer:
     the PEFT wrapper, and the per-session optimizer state; the worker
     simply asks it to run operations.
 
-    Multi-GPU support is wired through :class:`ParallelConfig` but the
-    heavy lifting (FSDP2/TP/CP) is provided by an extension package
-    that registers helpers via :mod:`hatchery.core.parallel_hooks`.
+    Multi-GPU support is wired through :class:`ParallelConfig` and
+    :class:`hatchery.core.distributed.DistributedRuntime`. Core owns
+    DP-only FSDP2; TP/CP remain extension-owned.
     """
 
     def __init__(
@@ -281,13 +285,9 @@ class VanillaTrainer:
         # LoRA-required policy for BitNet bases.
         self._quant_scheme: str = "none"
 
-        self._mesh = None
-        if self.parallel.is_distributed():
-            from hatchery.core.parallel_hooks import get_distributed_helpers
-
-            helpers = get_distributed_helpers()
-            helpers.init_distributed_if_needed(self.parallel)
-            self._mesh = helpers.build_device_mesh(self.parallel)
+        self._distributed_runtime = init_distributed_runtime(self.parallel)
+        self._mesh = self._distributed_runtime.mesh
+        self._dp_mesh = self._distributed_runtime.dp_mesh
 
         if load_model:
             self._load_base()
@@ -556,6 +556,23 @@ class VanillaTrainer:
                 "ParallelConfig.quant.require_full_param = False."
             )
 
+        adapter = self._adapter_name(session_id)
+        first_adapter = self._peft is None
+        adapter_exists = (
+            self._peft is not None and adapter in getattr(self._peft, "peft_config", {})
+        )
+        if (
+            self._distributed_runtime.is_core_dp_only
+            and self._parallel_applied
+            and not adapter_exists
+        ):
+            raise RuntimeError(
+                "Core FSDP2 DP currently supports only the first LoRA adapter "
+                "attached before FSDP wrapping. Dynamic adapter attach, reload, "
+                "eviction, and cross-rank portability for later adapters are "
+                "unsupported in v1."
+            )
+
         from peft import LoraConfig, get_peft_model
 
         # If a full-param session was previously active, the base in
@@ -565,7 +582,6 @@ class VanillaTrainer:
         # set up against.
         self._stash_active_full_param_base()
         self._restore_pristine_base()
-        adapter = self._adapter_name(session_id)
         lora_kwargs = {
             "r": spec.rank,
             "lora_alpha": spec.lora_alpha,
@@ -579,10 +595,9 @@ class VanillaTrainer:
         if spec.init_lora_weights != "default":
             lora_kwargs["init_lora_weights"] = spec.init_lora_weights
         lora_config = LoraConfig(**lora_kwargs)
-        first_adapter = self._peft is None
         if first_adapter:
             self._peft = get_peft_model(self._raw_base, lora_config, adapter_name=adapter)
-        elif adapter not in self._peft.peft_config:
+        elif not adapter_exists:
             self._peft.add_adapter(adapter, lora_config)
         self._peft.set_adapter(adapter)
         self._specs[session_id] = spec
@@ -608,6 +623,12 @@ class VanillaTrainer:
         the session becomes active. New full-param sessions start from
         the pristine base captured at load time.
         """
+        if self._distributed_runtime.is_core_dp_only:
+            raise RuntimeError(
+                "Full-parameter sessions are unsupported under core FSDP2 DP "
+                "in v1. Use LoRA with a single adapter, or run full-parameter "
+                "training with dp_degree=1."
+            )
         if session_id in self._specs:
             existing = self._specs[session_id]
             if not existing.is_full_param:
@@ -631,34 +652,29 @@ class VanillaTrainer:
         self._optimizer_state.setdefault(session_id, None)
 
     def _apply_parallel_plan(self) -> None:
-        """Apply FSDP2/TP to the decoder layers of the PEFT-wrapped base.
+        """Apply the runtime-selected parallel plan to the PEFT-wrapped base.
 
         Called exactly once, the first time a session is attached. After
         this runs the base-model decoder layers are sharded across the
         DP mesh and every subsequent session just adds an adapter on top
         of the already-parallelized modules.
         """
-        if self._peft is None or self._mesh is None:
+        if self._peft is None or not self._distributed_runtime.is_distributed:
             return
-        from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard
-
-        try:
-            inner = self._peft.base_model.model.model.layers
-        except AttributeError:
+        if self._distributed_runtime.is_core_dp_only:
+            apply_core_fsdp2_dp(self._peft, self._distributed_runtime, self.parallel)
             return
 
-        dp_mesh = None
-        if self.parallel.dp_degree > 1 and "dp" in self._mesh.mesh_dim_names:
-            dp_mesh = self._mesh["dp"]
-        if dp_mesh is None:
+        extension = self._distributed_runtime.extension_handle
+        apply_plan = getattr(extension, "apply_parallel_plan", None)
+        if callable(apply_plan):
+            apply_plan(self._peft, self._distributed_runtime, self.parallel)
             return
-
-        fsdp_kwargs: dict[str, Any] = {"mesh": dp_mesh}
-        if self.parallel.offload.cpu_offload_params:
-            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
-
-        for block in inner:
-            fully_shard(block, **fsdp_kwargs)
+        raise RuntimeError(
+            "Distributed runtime did not provide a parallel plan for "
+            f"dp={self.parallel.dp_degree},tp={self.parallel.tp_degree},"
+            f"cp={self.parallel.cp_degree}."
+        )
 
     def _allocate_batch(self, data: list[dict]) -> list[dict]:
         """Route DP batch allocation through the shared helper.
@@ -668,15 +684,7 @@ class VanillaTrainer:
         configured on ``self.parallel``. See
         :func:`hatchery.core.batching.prepare_batch_for_dp`.
         """
-        if not self.parallel.is_distributed() or self.parallel.dp_degree <= 1:
-            return list(data)
-        try:
-            import torch.distributed as dist  # noqa: PLC0415
-
-            if not dist.is_initialized():
-                return list(data)
-            rank = dist.get_rank()
-        except Exception:  # noqa: BLE001
+        if not self.parallel.is_distributed() or self._distributed_runtime.dp_world_size <= 1:
             return list(data)
 
         from hatchery.core.batching import BatchStrategy, prepare_batch_for_dp
@@ -687,14 +695,20 @@ class VanillaTrainer:
             strategy = BatchStrategy.AUTO
         allocation = prepare_batch_for_dp(
             data,
-            dp_degree=self.parallel.dp_degree,
-            rank=rank,
+            dp_degree=self._distributed_runtime.dp_world_size,
+            rank=self._distributed_runtime.dp_rank,
             strategy=strategy,
         )
         return allocation.data
 
     def detach_session(self, session_id: str) -> None:
         spec = self._specs.get(session_id)
+        if self._distributed_runtime.is_core_dp_only and spec is not None:
+            raise RuntimeError(
+                "Core FSDP2 DP does not support session detach/eviction in v1; "
+                "adapter deletion and later reload after FSDP wrapping are not "
+                "portable yet."
+            )
         if spec is not None and not spec.is_full_param:
             adapter = self._adapter_name(session_id)
             if self._peft is not None and adapter in getattr(self._peft, "peft_config", {}):
@@ -896,26 +910,7 @@ class VanillaTrainer:
             if position_ids is not None:
                 position_ids = position_ids.to(self.device)
 
-            # Context parallel: open the ring-attention region around the
-            # forward + backward. The CP context manager shards input_ids,
-            # attn_mask, and labels in-place along the seq dim. Packing +
-            # CP is rejected at ParallelConfig level, so when position_ids
-            # is set we know len(sub_batches) == 1 anyway.
-            if self.parallel.is_distributed():
-                from hatchery.core.parallel_hooks import get_distributed_helpers
-
-                helpers = get_distributed_helpers()
-                cp_mesh = helpers.get_cp_mesh(self._mesh, self.parallel)
-                cp_ctx = helpers.context_parallel_region(
-                    cp_mesh,
-                    buffers=[input_ids, attn_mask, labels],
-                    seq_dims=[1, 1, 1],
-                    no_restore={input_ids, attn_mask, labels},
-                )
-            else:
-                from contextlib import nullcontext
-
-                cp_ctx = nullcontext()
+            cp_ctx = self._context_parallel_region(input_ids, attn_mask, labels)
 
             with self._exec_context(spec), cp_ctx:
                 outputs = model(**self._model_kwargs(input_ids, attn_mask, position_ids))
@@ -1097,6 +1092,40 @@ class VanillaTrainer:
         return LogprobsResult(logprobs=results, total_tokens=total)
 
     # ── Helpers ─────────────────────────────────────────────
+
+    def _context_parallel_region(self, input_ids: Any, attn_mask: Any, labels: Any):
+        """Return the extension-owned CP context, or a no-op for core DP."""
+        from contextlib import nullcontext
+
+        if self.parallel.cp_degree <= 1:
+            return nullcontext()
+
+        extension = self._distributed_runtime.extension_handle
+        context_region = getattr(extension, "context_parallel_region", None)
+        if callable(context_region):
+            cp_mesh = getattr(self._distributed_runtime, "cp_mesh", None)
+            if cp_mesh is None:
+                from hatchery.core.parallel_hooks import get_distributed_helpers
+
+                helpers = get_distributed_helpers()
+                cp_mesh = helpers.get_cp_mesh(self._mesh, self.parallel)
+            return context_region(
+                cp_mesh,
+                buffers=[input_ids, attn_mask, labels],
+                seq_dims=[1, 1, 1],
+                no_restore={input_ids, attn_mask, labels},
+            )
+
+        from hatchery.core.parallel_hooks import get_distributed_helpers
+
+        helpers = get_distributed_helpers()
+        cp_mesh = helpers.get_cp_mesh(self._mesh, self.parallel)
+        return helpers.context_parallel_region(
+            cp_mesh,
+            buffers=[input_ids, attn_mask, labels],
+            seq_dims=[1, 1, 1],
+            no_restore={input_ids, attn_mask, labels},
+        )
 
     def _collate(self, data: list[dict]) -> list[dict[str, Any]]:
         """Return a list of sub-batches, each a forward-call's worth of tensors.

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import builtins
+import sys
 import types
 
 import pytest
@@ -12,8 +13,10 @@ import pytest
 from hatchery.core.distributed import (
     CORE_DP_EXTENSION_NAME,
     DistributedRuntime,
+    apply_core_fsdp2_dp,
     destroy_distributed_runtime,
     init_distributed_runtime,
+    iter_decoder_layers,
 )
 from hatchery.core.parallel import ParallelConfig
 from hatchery.core.parallel_hooks import (
@@ -242,6 +245,82 @@ def test_cleanup_delegates_to_owning_extension():
     destroy_distributed_runtime(runtime)
 
     assert cleaned == [runtime]
+
+
+def test_iter_decoder_layers_supports_peft_and_gpt2_layouts():
+    peft_layers = [object(), object()]
+    peft_gpt2_layers = [object()]
+    gpt2_layers = [object()]
+    peft = types.SimpleNamespace(
+        base_model=types.SimpleNamespace(
+            model=types.SimpleNamespace(model=types.SimpleNamespace(layers=peft_layers))
+        )
+    )
+    peft_gpt2 = types.SimpleNamespace(
+        base_model=types.SimpleNamespace(
+            model=types.SimpleNamespace(transformer=types.SimpleNamespace(h=peft_gpt2_layers))
+        )
+    )
+    gpt2 = types.SimpleNamespace(transformer=types.SimpleNamespace(h=gpt2_layers))
+
+    assert list(iter_decoder_layers(peft)) == peft_layers
+    assert list(iter_decoder_layers(peft_gpt2)) == peft_gpt2_layers
+    assert list(iter_decoder_layers(gpt2)) == gpt2_layers
+
+
+def test_apply_core_fsdp2_dp_wraps_discovered_layers(monkeypatch):
+    calls: list[tuple[object, dict]] = []
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+
+    class CPUOffloadPolicy:  # noqa: D401 - test stub
+        pass
+
+    def fully_shard(block, **kwargs):
+        calls.append((block, kwargs))
+
+    fake_fsdp.CPUOffloadPolicy = CPUOffloadPolicy
+    fake_fsdp.fully_shard = fully_shard
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+
+    layers = [object(), object()]
+    model = types.SimpleNamespace(transformer=types.SimpleNamespace(h=layers))
+    runtime = DistributedRuntime(
+        global_rank=0,
+        local_rank=0,
+        dp_rank=0,
+        world_size=2,
+        dp_world_size=2,
+        device=None,
+        dp_mesh="dp-mesh",
+        is_core_dp_only=True,
+    )
+
+    apply_core_fsdp2_dp(model, runtime, ParallelConfig(dp_degree=2))
+
+    assert calls == [
+        (layers[0], {"mesh": "dp-mesh"}),
+        (layers[1], {"mesh": "dp-mesh"}),
+    ]
+
+
+def test_apply_core_fsdp2_dp_raises_on_unknown_layout(monkeypatch):
+    fake_fsdp = types.ModuleType("torch.distributed.fsdp")
+    fake_fsdp.CPUOffloadPolicy = object
+    fake_fsdp.fully_shard = lambda block, **kwargs: None
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp", fake_fsdp)
+    runtime = DistributedRuntime(
+        global_rank=0,
+        local_rank=0,
+        dp_rank=0,
+        world_size=2,
+        dp_world_size=2,
+        device=None,
+        dp_mesh="dp-mesh",
+        is_core_dp_only=True,
+    )
+
+    with pytest.raises(RuntimeError, match="could not discover decoder layers"):
+        apply_core_fsdp2_dp(types.SimpleNamespace(), runtime, ParallelConfig(dp_degree=2))
 
 
 def _install_fake_torch(monkeypatch, *, cuda_available: bool, dist_initialized: bool):
