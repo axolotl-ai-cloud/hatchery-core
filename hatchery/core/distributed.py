@@ -14,12 +14,10 @@ from typing import Any, Optional
 from hatchery.core.parallel import ParallelConfig
 from hatchery.core.parallel_hooks import (
     ParallelExtension,
-    _legacy_helpers_for_config,
     select_parallel_extension,
 )
 
 CORE_DP_EXTENSION_NAME = "hatchery-core-fsdp2-dp"
-LEGACY_HELPERS_EXTENSION_NAME = "legacy-distributed-helpers"
 
 
 @dataclass
@@ -73,25 +71,6 @@ def init_distributed_runtime(config: ParallelConfig) -> DistributedRuntime:
     if extension is not None:
         return _init_extension_runtime(extension, config)
 
-    legacy_helpers = _legacy_helpers_for_config(config)
-    if legacy_helpers is not None:
-        legacy_helpers.init_distributed_if_needed(config)
-        mesh = legacy_helpers.build_device_mesh(config)
-        return DistributedRuntime(
-            global_rank=_int_env("RANK", 0),
-            local_rank=_int_env("LOCAL_RANK", 0),
-            dp_rank=0,
-            world_size=_int_env("WORLD_SIZE", config.world_size()),
-            dp_world_size=config.dp_degree,
-            device=_legacy_device(),
-            mesh=mesh,
-            dp_mesh=None,
-            owns_process_group=False,
-            owns_runtime=False,
-            extension_name=LEGACY_HELPERS_EXTENSION_NAME,
-            extension_handle=legacy_helpers,
-        )
-
     raise RuntimeError(_unsupported_parallel_config_message(config))
 
 
@@ -133,14 +112,11 @@ def iter_decoder_layers(model: Any) -> Iterable[Any]:
             return
 
 
-def apply_core_fsdp2_dp(
-    model: Any, runtime: DistributedRuntime, config: ParallelConfig
-) -> None:
+def apply_core_fsdp2_dp(model: Any, runtime: DistributedRuntime, config: ParallelConfig) -> None:
     """Apply core-owned FSDP2 DP wrapping to decoder layers."""
     if not runtime.is_core_dp_only:
         raise RuntimeError(
-            "apply_core_fsdp2_dp requires a core DP-only runtime; "
-            f"got {runtime.extension_name!r}."
+            f"apply_core_fsdp2_dp requires a core DP-only runtime; got {runtime.extension_name!r}."
         )
     if runtime.dp_mesh is None:
         raise RuntimeError("Core FSDP2 DP runtime is missing a dp_mesh.")
@@ -240,18 +216,3 @@ def _required_int_env(name: str) -> int:
         return int(raw)
     except ValueError as exc:
         raise RuntimeError(f"Core DP-only runtime env var {name} must be an integer.") from exc
-
-
-def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _legacy_device() -> str | None:
-    local_rank = os.environ.get("LOCAL_RANK")
-    return f"cuda:{local_rank}" if local_rank is not None else None

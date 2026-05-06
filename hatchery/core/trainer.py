@@ -558,8 +558,8 @@ class VanillaTrainer:
 
         adapter = self._adapter_name(session_id)
         first_adapter = self._peft is None
-        adapter_exists = (
-            self._peft is not None and adapter in getattr(self._peft, "peft_config", {})
+        adapter_exists = self._peft is not None and adapter in getattr(
+            self._peft, "peft_config", {}
         )
         if (
             self._distributed_runtime.is_core_dp_only
@@ -1104,11 +1104,6 @@ class VanillaTrainer:
         context_region = getattr(extension, "context_parallel_region", None)
         if callable(context_region):
             cp_mesh = getattr(self._distributed_runtime, "cp_mesh", None)
-            if cp_mesh is None:
-                from hatchery.core.parallel_hooks import get_distributed_helpers
-
-                helpers = get_distributed_helpers()
-                cp_mesh = helpers.get_cp_mesh(self._mesh, self.parallel)
             return context_region(
                 cp_mesh,
                 buffers=[input_ids, attn_mask, labels],
@@ -1116,15 +1111,9 @@ class VanillaTrainer:
                 no_restore={input_ids, attn_mask, labels},
             )
 
-        from hatchery.core.parallel_hooks import get_distributed_helpers
-
-        helpers = get_distributed_helpers()
-        cp_mesh = helpers.get_cp_mesh(self._mesh, self.parallel)
-        return helpers.context_parallel_region(
-            cp_mesh,
-            buffers=[input_ids, attn_mask, labels],
-            seq_dims=[1, 1, 1],
-            no_restore={input_ids, attn_mask, labels},
+        raise RuntimeError(
+            "Context parallelism requires a registered ParallelExtension "
+            "with context_parallel_region support."
         )
 
     def _collate(self, data: list[dict]) -> list[dict[str, Any]]:

@@ -20,10 +20,8 @@ from hatchery.core.distributed import (
 )
 from hatchery.core.parallel import ParallelConfig
 from hatchery.core.parallel_hooks import (
-    DistributedHelpers,
     ParallelExtension,
     _reset_parallel_hooks_for_tests,
-    register_distributed_helpers,
     register_parallel_extension,
 )
 
@@ -61,14 +59,16 @@ def test_noop_runtime_is_lazy_and_torch_free(monkeypatch):
     assert not runtime.is_core_dp_only
 
 
-def test_core_dp_selection_wins_over_registered_helpers(monkeypatch):
+def test_core_dp_selection_wins_over_registered_extensions(monkeypatch):
     calls: list[str] = []
-    register_distributed_helpers(
-        DistributedHelpers(
-            init_distributed_if_needed=lambda config: calls.append("init"),
-            build_device_mesh=lambda config: "legacy-mesh",
-            get_cp_mesh=lambda mesh, config: "cp-mesh",
-            context_parallel_region=lambda *args, **kwargs: None,
+    register_parallel_extension(
+        ParallelExtension(
+            name="mixed-extension",
+            init_runtime=lambda config: calls.append("init"),
+            apply_parallel_plan=lambda model, runtime, config: None,
+            supports_tp=True,
+            supports_cp=True,
+            supports_mixed_dp=True,
         )
     )
     _install_fake_torch(monkeypatch, cuda_available=True, dist_initialized=False)
@@ -140,36 +140,7 @@ def test_capability_extension_selection_for_tp_cp():
     assert runtime.mesh == "extension-mesh"
 
 
-def test_legacy_helpers_only_apply_to_tp_cp_and_warn():
-    calls: list[str] = []
-    register_distributed_helpers(
-        DistributedHelpers(
-            init_distributed_if_needed=lambda config: calls.append("init"),
-            build_device_mesh=lambda config: "legacy-mesh",
-            get_cp_mesh=lambda mesh, config: "legacy-cp-mesh",
-            context_parallel_region=lambda *args, **kwargs: None,
-        )
-    )
-
-    with pytest.warns(DeprecationWarning, match="register_distributed_helpers"):
-        runtime = init_distributed_runtime(ParallelConfig(tp_degree=2))
-
-    assert calls == ["init"]
-    assert runtime.extension_name == "legacy-distributed-helpers"
-    assert runtime.mesh == "legacy-mesh"
-    assert runtime.dp_mesh is None
-
-
-def test_registered_extension_takes_precedence_over_legacy_helpers_for_tp():
-    calls: list[str] = []
-    register_distributed_helpers(
-        DistributedHelpers(
-            init_distributed_if_needed=lambda config: calls.append("legacy"),
-            build_device_mesh=lambda config: "legacy-mesh",
-            get_cp_mesh=lambda mesh, config: "legacy-cp-mesh",
-            context_parallel_region=lambda *args, **kwargs: None,
-        )
-    )
+def test_registered_extension_handles_tp():
     register_parallel_extension(
         ParallelExtension(
             name="tp-extension",
@@ -189,7 +160,6 @@ def test_registered_extension_takes_precedence_over_legacy_helpers_for_tp():
 
     runtime = init_distributed_runtime(ParallelConfig(tp_degree=2))
 
-    assert calls == []
     assert runtime.extension_name == "tp-extension"
     assert runtime.mesh == "extension-mesh"
 
@@ -331,17 +301,17 @@ def _install_fake_torch(monkeypatch, *, cuda_available: bool, dist_initialized: 
 
     fake_dist = _FakeDist(dist_initialized)
     fake_device_mesh = types.ModuleType("torch.distributed.device_mesh")
-    fake_device_mesh.init_device_mesh = (
-        lambda device, shape, mesh_dim_names: {
-            "device": device,
-            "shape": shape,
-            "names": mesh_dim_names,
-        }
-    )
+    fake_device_mesh.init_device_mesh = lambda device, shape, mesh_dim_names: {
+        "device": device,
+        "shape": shape,
+        "names": mesh_dim_names,
+    }
 
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
     monkeypatch.setitem(__import__("sys").modules, "torch.distributed", fake_dist)
-    monkeypatch.setitem(__import__("sys").modules, "torch.distributed.device_mesh", fake_device_mesh)
+    monkeypatch.setitem(
+        __import__("sys").modules, "torch.distributed.device_mesh", fake_device_mesh
+    )
     return types.SimpleNamespace(torch=fake_torch, cuda=fake_cuda, dist=fake_dist)
 
 
