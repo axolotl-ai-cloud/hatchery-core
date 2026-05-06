@@ -225,10 +225,11 @@ ruff format --check hatchery/ tests/
 python -m pytest tests/ -q
 ```
 
-GPU tests live under `tests/torch_tests` and require CUDA plus compatible model/cache access:
+GPU tests live under `tests/torch_tests` and `tests/torch_distributed`.
+They require CUDA plus compatible model/cache access:
 
 ```bash
-python -m pytest tests/torch_tests/ -q
+python -m pytest tests/torch_tests/ tests/torch_distributed/ -q
 ```
 
 ## Project Status

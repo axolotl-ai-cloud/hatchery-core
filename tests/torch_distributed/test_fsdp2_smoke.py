@@ -6,8 +6,9 @@
 
 These tests only run when at least 2 CUDA devices are visible and
 torchrun is on ``$PATH`` (which it is whenever torch is installed).
-Each test subprocess-invokes a standalone script in ``tests/dist/`` and
-asserts on the JSON result the script writes.
+Each test subprocess-invokes a standalone torchrun entrypoint in
+``tests/torch_distributed/scripts/`` and asserts on the JSON result the
+script writes.
 
 Rationale for subprocess: ``torch.distributed.init_process_group`` must
 run in a fresh process per rank, and doing that cleanly inside pytest's
@@ -26,7 +27,7 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DIST_DIR = _REPO_ROOT / "tests" / "dist"
+_DIST_SCRIPT_DIR = _REPO_ROOT / "tests" / "torch_distributed" / "scripts"
 
 
 def _gpu_count() -> int:
@@ -80,7 +81,7 @@ def _run_torchrun(script: Path, out_path: Path, extra: list[str]) -> dict:
 def test_fsdp2_smoke_pure_torch(tmp_path):
     """FSDP2 on a toy model — validates parallel.py plumbing end-to-end."""
     out = tmp_path / "fsdp2.json"
-    result = _run_torchrun(_DIST_DIR / "fsdp2_smoke.py", out, [])
+    result = _run_torchrun(_DIST_SCRIPT_DIR / "fsdp2_smoke.py", out, [])
     assert result["status"] == "ok"
     assert result["world_size"] == 2
     assert result["mesh_dims"] == ["dp"]
@@ -91,7 +92,7 @@ def test_fsdp2_smoke_vanilla_trainer(tmp_path):
     """VanillaTrainer + PEFT + FSDP2 on a tiny local causal LM."""
     out = tmp_path / "trainer.json"
     result = _run_torchrun(
-        _DIST_DIR / "trainer_fsdp2_smoke.py",
+        _DIST_SCRIPT_DIR / "trainer_fsdp2_smoke.py",
         out,
         ["--steps", "4"],
     )
