@@ -625,3 +625,302 @@ async def test_handle_sample_peft_verifier_passed_to_dflash():
 
     assert len(captured_verifier) == 1
     assert captured_verifier[0] is expected_model
+
+
+# ── New canonical-DFlash adapter behaviors ───────────────────────────────────
+
+
+def _make_real_shaped_dflash_module(generate_fn=None) -> ModuleType:
+    """Fake dflash module with the canonical attribute surface.
+
+    Exposes ``model.dflash_generate`` and ``DFlashDraftModel`` so the
+    integration takes the real-draft path. ``generate_fn`` defaults to
+    returning a 1×(prompt+gen) tensor — the shape ``return_stats=False``
+    would produce — so we exercise the tensor normalization branch.
+    """
+    mod = ModuleType("dflash")
+    inner = ModuleType("dflash.model")
+    if generate_fn is None:
+        # Default: return a tensor 1×(prompt+gen) of 5 generated ids.
+        def _default_gen(**kwargs):
+            input_ids = kwargs["input_ids"]
+            extra = torch.full((1, 5), 99, dtype=torch.long)
+            return torch.cat([input_ids, extra], dim=1)
+
+        generate_fn = _default_gen
+    inner.dflash_generate = MagicMock(side_effect=generate_fn)
+    mod.model = inner
+    mod.dflash_generate = inner.dflash_generate
+    mod.DFlashDraftModel = MagicMock(name="DFlashDraftModel")
+    return mod
+
+
+class _FakePEFTWrappedVerifier:
+    """Stand-in for a PeftModelForCausalLM with a LoRA-augmented inner causal LM."""
+
+    class _InnerCausalLM:
+        # Has the attributes DFlash reaches into.
+        def __init__(self):
+            self.model = SimpleNamespace()  # transformer body
+            self.lm_head = SimpleNamespace()
+
+    class _LoraWrapper:
+        def __init__(self, inner):
+            self.model = inner
+
+    def __init__(self):
+        self._inner = _FakePEFTWrappedVerifier._InnerCausalLM()
+        self.base_model = _FakePEFTWrappedVerifier._LoraWrapper(self._inner)
+        self.device = torch.device("cpu")
+        self.dtype = torch.float32
+
+
+def test_resolve_verifier_for_dflash_unwraps_peft():
+    """PEFT-wrapped verifier resolves to the inner LoRA-augmented causal LM."""
+    from hatchery.core.dflash_integration import _resolve_verifier_for_dflash
+
+    verifier = _FakePEFTWrappedVerifier()
+    resolved = _resolve_verifier_for_dflash(verifier)
+    assert resolved is verifier._inner  # inner causal LM with .model + .lm_head
+
+
+def test_resolve_verifier_for_dflash_passthrough_for_plain_model():
+    from hatchery.core.dflash_integration import _resolve_verifier_for_dflash
+
+    plain = SimpleNamespace(model=SimpleNamespace(), lm_head=SimpleNamespace())
+    assert _resolve_verifier_for_dflash(plain) is plain
+
+
+def test_resolve_stop_token_ids_includes_eos():
+    from hatchery.core.dflash_integration import _resolve_stop_token_ids
+
+    tok = MagicMock()
+    tok.eos_token_id = 7
+    assert _resolve_stop_token_ids(None, tok) == [7]
+
+
+def test_resolve_stop_token_ids_string_to_single_token():
+    from hatchery.core.dflash_integration import _resolve_stop_token_ids
+
+    tok = MagicMock()
+    tok.eos_token_id = 2
+    tok.encode.return_value = [42]
+    out = _resolve_stop_token_ids(["</s>"], tok)
+    assert out == [2, 42]
+
+
+def test_resolve_stop_token_ids_drops_multi_token_string():
+    from hatchery.core.dflash_integration import _resolve_stop_token_ids
+
+    tok = MagicMock()
+    tok.eos_token_id = 2
+    tok.encode.return_value = [3, 4, 5]
+    out = _resolve_stop_token_ids(["multi token stop"], tok)
+    assert out == [2]  # eos kept; multi-token stop dropped
+
+
+def test_resolve_stop_token_ids_int_passthrough_dedup():
+    from hatchery.core.dflash_integration import _resolve_stop_token_ids
+
+    tok = MagicMock()
+    tok.eos_token_id = 5
+    out = _resolve_stop_token_ids([5, 99], tok)
+    assert out == [5, 99]
+
+
+def test_real_dflash_n_gt_1_falls_back_with_metadata():
+    """Real-shaped dflash module + n>1 produces n_gt_1_unsupported fallback."""
+    dflash_mod = _make_real_shaped_dflash_module()
+    verifier = _FakePEFTWrappedVerifier()
+    tok = MagicMock()
+    tok.eos_token_id = 0
+
+    with patch.dict(sys.modules, {"dflash": dflash_mod}):
+        result, meta = run_dflash_sample(
+            verifier_model=verifier,
+            tokenizer=tok,
+            prompt_tokens=[1, 2, 3],
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            n=2,  # > 1 → fallback
+            seed=None,
+            stop=None,
+            spec_request=_make_spec_request(),
+            dflash_config=_make_dflash_config(),
+            device="cpu",
+        )
+
+    assert result is None
+    assert meta.fallback_reason == "n_gt_1_unsupported"
+
+
+def test_real_dflash_top_p_falls_back_with_metadata():
+    dflash_mod = _make_real_shaped_dflash_module()
+    verifier = _FakePEFTWrappedVerifier()
+    tok = MagicMock()
+    tok.eos_token_id = 0
+
+    with patch.dict(sys.modules, {"dflash": dflash_mod}):
+        result, meta = run_dflash_sample(
+            verifier_model=verifier,
+            tokenizer=tok,
+            prompt_tokens=[1, 2, 3],
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=0.9,  # constrained → fallback
+            top_k=-1,
+            n=1,
+            seed=None,
+            stop=None,
+            spec_request=_make_spec_request(),
+            dflash_config=_make_dflash_config(),
+            device="cpu",
+        )
+
+    assert result is None
+    assert meta.fallback_reason == "top_p_top_k_unsupported"
+
+
+def test_real_dflash_strict_top_p_raises():
+    dflash_mod = _make_real_shaped_dflash_module()
+    verifier = _FakePEFTWrappedVerifier()
+    tok = MagicMock()
+    tok.eos_token_id = 0
+    req = SpeculativeDecodingRequest(enable=True, strict=True)
+
+    with patch.dict(sys.modules, {"dflash": dflash_mod}):
+        with pytest.raises(ValueError, match="top_p"):
+            run_dflash_sample(
+                verifier_model=verifier,
+                tokenizer=tok,
+                prompt_tokens=[1, 2, 3],
+                max_new_tokens=8,
+                temperature=0.0,
+                top_p=0.5,
+                top_k=-1,
+                n=1,
+                seed=None,
+                stop=None,
+                spec_request=req,
+                dflash_config=_make_dflash_config(),
+                device="cpu",
+            )
+
+
+def test_real_dflash_tensor_output_normalization():
+    """Real-shaped module returning a tensor produces a strip-prompt result with text."""
+    captured_kwargs = {}
+
+    def fake_generate(**kwargs):
+        captured_kwargs.update(kwargs)
+        # Build output_ids = prompt + 4 new tokens; second-to-last is EOS=2.
+        in_ids = kwargs["input_ids"]
+        new = torch.tensor([[10, 11, 2, 13]], dtype=torch.long)
+        return torch.cat([in_ids, new], dim=1)
+
+    dflash_mod = _make_real_shaped_dflash_module(generate_fn=fake_generate)
+    verifier = _FakePEFTWrappedVerifier()
+    tok = MagicMock()
+    tok.eos_token_id = 2
+    tok.decode.return_value = "decoded"
+
+    # Patch the loader to skip AutoModel.from_pretrained.
+    with patch.dict(sys.modules, {"dflash": dflash_mod}), patch(
+        "hatchery.core.dflash_integration._load_draft_model",
+        return_value=MagicMock(name="loaded_draft"),
+    ):
+        result, meta = run_dflash_sample(
+            verifier_model=verifier,
+            tokenizer=tok,
+            prompt_tokens=[1, 2, 3],
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            n=1,
+            seed=None,
+            stop=None,
+            spec_request=_make_spec_request(),
+            dflash_config=_make_dflash_config(),
+            device="cpu",
+        )
+
+    assert result is not None
+    assert result["sequences"] == [[10, 11, 2, 13]]
+    assert result["texts"] == ["decoded"]
+    # The integration unwrapped the PEFT verifier to the inner LoRA-augmented LM
+    # before forwarding to dflash.
+    assert captured_kwargs["target"] is verifier._inner
+    # Stop ids include the tokenizer's EOS.
+    assert 2 in captured_kwargs["stop_token_ids"]
+    assert meta.used_backend == "dflash"
+    # Real call uses canonical kwargs (no legacy verifier=/draft= keys).
+    assert "verifier" not in captured_kwargs
+    assert "draft" not in captured_kwargs
+    assert captured_kwargs["return_stats"] is True
+
+
+def test_real_dflash_draft_load_error_falls_back():
+    dflash_mod = _make_real_shaped_dflash_module()
+    verifier = _FakePEFTWrappedVerifier()
+    tok = MagicMock()
+    tok.eos_token_id = 0
+
+    def boom(*a, **kw):
+        raise OSError("could not download draft weights")
+
+    with patch.dict(sys.modules, {"dflash": dflash_mod}), patch(
+        "hatchery.core.dflash_integration._load_draft_model", side_effect=boom
+    ):
+        result, meta = run_dflash_sample(
+            verifier_model=verifier,
+            tokenizer=tok,
+            prompt_tokens=[1, 2, 3],
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            n=1,
+            seed=None,
+            stop=None,
+            spec_request=_make_spec_request(),
+            dflash_config=_make_dflash_config(),
+            device="cpu",
+        )
+
+    assert result is None
+    assert meta.fallback_reason == "draft_load_error:OSError"
+
+
+def test_real_dflash_module_without_generate_falls_back():
+    """If the installed dflash exposes neither dflash_generate nor generate, fall back."""
+    mod = ModuleType("dflash")
+    # Has DFlashDraftModel + model namespace but no callable generate.
+    mod.DFlashDraftModel = MagicMock()
+    mod.model = ModuleType("dflash.model")  # no dflash_generate
+
+    verifier = _FakePEFTWrappedVerifier()
+    tok = MagicMock()
+    tok.eos_token_id = 0
+
+    with patch.dict(sys.modules, {"dflash": mod}):
+        result, meta = run_dflash_sample(
+            verifier_model=verifier,
+            tokenizer=tok,
+            prompt_tokens=[1, 2, 3],
+            max_new_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            n=1,
+            seed=None,
+            stop=None,
+            spec_request=_make_spec_request(),
+            dflash_config=_make_dflash_config(),
+            device="cpu",
+        )
+
+    assert result is None
+    assert meta.fallback_reason == "dflash_api_unavailable"
