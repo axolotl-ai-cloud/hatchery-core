@@ -1382,11 +1382,7 @@ class GPUWorker:
             return
         if self._mesh is None:
             return
-        from torch.distributed.fsdp import (
-            CPUOffloadPolicy,
-            fully_shard,
-            register_fsdp_forward_method,
-        )
+        from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard
 
         try:
             inner = self._peft.base_model.model.model.layers
@@ -1406,8 +1402,13 @@ class GPUWorker:
         for block in inner:
             fully_shard(block, **kwargs)
         fully_shard(self._peft, **kwargs)
-        if hasattr(self._peft, "generate"):
-            register_fsdp_forward_method(self._peft, "generate")
+        try:
+            from torch.distributed import fsdp
+        except ImportError:
+            return
+        register = getattr(fsdp, "register_fsdp_forward_method", None)
+        if callable(register) and hasattr(self._peft, "generate"):
+            register(self._peft, "generate")
 
     async def _save_session_to_store(
         self,
