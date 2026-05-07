@@ -150,6 +150,28 @@ jobs:
       - name: Install build tooling
         run: uv pip install --system build
 
+      - name: Stamp CI-local package version
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          base_version = Path("VERSION").read_text().strip().split("+", 1)[0]
+          local_version = f"{base_version}+venvstacks.{os.environ['GITHUB_SHA'][:12].lower()}"
+          Path("VERSION").write_text(f"{local_version}\n")
+
+          spec_path = Path("packaging/venvstacks/venvstacks.toml")
+          spec = spec_path.read_text()
+          spec = re.sub(
+              r'"hatchery-core==[^"]+"',
+              f'"hatchery-core=={base_version}"',
+              spec,
+          )
+          spec_path.write_text(spec)
+          print(f"Using local Hatchery wheel version {local_version}")
+          PY
+
       - name: Build Hatchery wheel for stack
         run: python -m build --wheel --outdir packaging/venvstacks/wheelhouse
 
