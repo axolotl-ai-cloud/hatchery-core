@@ -72,6 +72,12 @@ class Config:
     # ``None`` means use LocalPEFTSamplingBackend (worker-local).
     sampling_backend: Optional[object] = None
 
+    # DFlash speculative decoding config. ``None`` disables DFlash entirely.
+    # Set to a ``DFlashConfig`` instance to enable speculative decoding for
+    # eligible ``sample`` requests handled by ``GPUWorker._handle_sample``.
+    # Import lazily to avoid pulling in dflash at core import time.
+    dflash: Optional[object] = None
+
     # LoRA state persister. Default is the bf16-snapshot-on-every-save
     # implementation in ``hatchery.core.lora_state``. Alternative persisters
     # that layer compression on top of the same on-disk layout can be

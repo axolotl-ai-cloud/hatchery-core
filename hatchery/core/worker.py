@@ -102,6 +102,17 @@ def _strip_vision_tokens(input_ids: list[int], vision_ids: set[int]) -> list[int
     return [t for t in input_ids if t not in vision_ids]
 
 
+def _spec_meta_to_dict(meta: Any) -> dict:
+    """Serialize a SpeculativeDecodingMetadata to a msgpack-safe dict."""
+    return {
+        "requested_backend": meta.requested_backend,
+        "used_backend": meta.used_backend,
+        "draft_model": meta.draft_model,
+        "max_draft_tokens": meta.max_draft_tokens,
+        "fallback_reason": meta.fallback_reason,
+    }
+
+
 @dataclass
 class _SessionRuntime:
     """In-RAM state for an active session on this worker."""
@@ -2490,6 +2501,44 @@ class GPUWorker:
         include_prompt_logprobs = bool(payload.get("include_prompt_logprobs", False))
         topk_prompt_logprobs = int(payload.get("topk_prompt_logprobs", 0) or 0)
 
+        # ── DFlash speculative decoding path ──────────────────────────────
+        # Attempted before the standard HF generate path when the request
+        # includes a speculative_decoding option and the worker has a
+        # DFlashConfig. Falls back to HF generate on any failure unless
+        # strict mode is set in the per-request options.
+        spec_meta = None
+        if payload.get("speculative_decoding") is not None:
+            from hatchery.core.dflash_integration import (
+                DFlashConfig,
+                parse_spec_request,
+                run_dflash_sample,
+            )
+
+            spec_request = parse_spec_request(payload)
+            dflash_cfg = getattr(self.config, "dflash", None)
+            if spec_request is not None and isinstance(dflash_cfg, DFlashConfig):
+                dflash_result, spec_meta = run_dflash_sample(
+                    verifier_model=model,
+                    tokenizer=self.tokenizer,
+                    prompt_tokens=prompt_tokens,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    n=n,
+                    seed=seed,
+                    stop=stop,
+                    spec_request=spec_request,
+                    dflash_config=dflash_cfg,
+                    device=self.device,
+                )
+                if dflash_result is not None:
+                    # DFlash generation succeeded — attach metadata and return.
+                    dflash_result["spec_decoding_metadata"] = _spec_meta_to_dict(spec_meta)
+                    total_tokens = sum(len(s) for s in dflash_result.get("sequences", []))
+                    return dflash_result, {"tokens": total_tokens, "spec_backend": "dflash"}
+                # spec_meta carries fallback_reason; fall through to HF generate.
+
         do_sample = temperature > 0 and (temperature != 1.0 or top_p != 1.0 or n > 1)
         if temperature == 0.0:
             do_sample = False
@@ -2580,6 +2629,10 @@ class GPUWorker:
             "stop_reasons": stop_reasons,
             "sequence_logprobs": per_seq_logprobs,
         }
+
+        # Attach spec decoding metadata when DFlash was attempted but fell back.
+        if spec_meta is not None:
+            response["spec_decoding_metadata"] = _spec_meta_to_dict(spec_meta)
 
         # Per-prompt-token logprobs and top-K. These are expensive
         # (extra forward pass over the prompt, full log-softmax at
