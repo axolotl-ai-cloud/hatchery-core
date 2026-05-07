@@ -167,6 +167,8 @@ jobs:
         run: |
           uvx --from venvstacks venvstacks build \
             --local-wheels wheelhouse \
+            --lock-if-needed \
+            --reset-lock "app-*" \
             --include-dependencies \
             packaging/venvstacks/venvstacks.toml
 
