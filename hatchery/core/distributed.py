@@ -137,6 +137,19 @@ def apply_core_fsdp2_dp(model: Any, runtime: DistributedRuntime, config: Paralle
     for block in layers:
         fully_shard(block, **fsdp_kwargs)
     fully_shard(model, **fsdp_kwargs)
+    _register_generate_forward_method_if_available(model)
+
+
+def _register_generate_forward_method_if_available(model: Any) -> None:
+    if not hasattr(model, "generate"):
+        return
+    try:
+        from torch.distributed import fsdp
+    except ImportError:
+        return
+    register = getattr(fsdp, "register_fsdp_forward_method", None)
+    if callable(register):
+        register(model, "generate")
 
 
 def _is_core_dp_only(config: ParallelConfig) -> bool:
