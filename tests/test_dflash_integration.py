@@ -387,6 +387,7 @@ def test_vanilla_path_enable_false_does_not_use_dflash():
 
 # ── _handle_sample routing via mocked worker ─────────────────────────────────
 
+
 class _FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 2
@@ -827,9 +828,12 @@ def test_real_dflash_tensor_output_normalization():
     tok.decode.return_value = "decoded"
 
     # Patch the loader to skip AutoModel.from_pretrained.
-    with patch.dict(sys.modules, {"dflash": dflash_mod}), patch(
-        "hatchery.core.dflash_integration._load_draft_model",
-        return_value=MagicMock(name="loaded_draft"),
+    with (
+        patch.dict(sys.modules, {"dflash": dflash_mod}),
+        patch(
+            "hatchery.core.dflash_integration._load_draft_model",
+            return_value=MagicMock(name="loaded_draft"),
+        ),
     ):
         result, meta = run_dflash_sample(
             verifier_model=verifier,
@@ -871,8 +875,9 @@ def test_real_dflash_draft_load_error_falls_back():
     def boom(*a, **kw):
         raise OSError("could not download draft weights")
 
-    with patch.dict(sys.modules, {"dflash": dflash_mod}), patch(
-        "hatchery.core.dflash_integration._load_draft_model", side_effect=boom
+    with (
+        patch.dict(sys.modules, {"dflash": dflash_mod}),
+        patch("hatchery.core.dflash_integration._load_draft_model", side_effect=boom),
     ):
         result, meta = run_dflash_sample(
             verifier_model=verifier,

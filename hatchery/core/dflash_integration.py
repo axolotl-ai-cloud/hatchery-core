@@ -196,9 +196,7 @@ def resolve_dflash_policy(
     if dflash_config is None or not dflash_config.enabled:
         meta.fallback_reason = "dflash_disabled"
         if spec_request.strict:
-            raise ValueError(
-                "DFlash is disabled on this worker but strict mode was requested"
-            )
+            raise ValueError("DFlash is disabled on this worker but strict mode was requested")
         return False, meta
 
     if not dflash_config.draft_model:
@@ -242,9 +240,7 @@ def _resolve_verifier_for_dflash(verifier_model: Any) -> Any:
     return inner
 
 
-def _resolve_stop_token_ids(
-    stop: Optional[list], tokenizer: Any
-) -> Optional[list[int]]:
+def _resolve_stop_token_ids(stop: Optional[list], tokenizer: Any) -> Optional[list[int]]:
     """Build the ``stop_token_ids`` list DFlash needs from Hatchery's mixed ``stop`` payload.
 
     Hatchery's wire format accepts ``stop`` as a list of strings or token IDs
@@ -374,8 +370,7 @@ def _normalize_dflash_output(
         acceptance_lengths = raw.get("acceptance_lengths")
         if texts is None:
             texts = [
-                tokenizer.decode(s, skip_special_tokens=True) if tokenizer else ""
-                for s in seqs
+                tokenizer.decode(s, skip_special_tokens=True) if tokenizer else "" for s in seqs
             ]
         if stop_reasons is None:
             stop_reasons = ["length"] * len(seqs)
@@ -440,9 +435,7 @@ def _normalize_dflash_output(
         # speculation step. Each entry of ``acceptance_lengths`` is the
         # number of accepted tokens for a single step (always ≥ 1 because
         # at least the verifier-emitted bonus token counts).
-        out["acceptance_rate"] = float(
-            sum(acceptance_lengths) / len(acceptance_lengths)
-        )
+        out["acceptance_rate"] = float(sum(acceptance_lengths) / len(acceptance_lengths))
 
     return out
 
@@ -518,9 +511,7 @@ def run_dflash_sample(
     if dflash_mod is None:
         meta.fallback_reason = "dflash_not_installed"
         if spec_request.strict:
-            raise ImportError(
-                "dflash package is not installed but strict mode was requested"
-            )
+            raise ImportError("dflash package is not installed but strict mode was requested")
         logger.warning(
             "dflash.not_installed",
             extra={"draft_model": meta.draft_model, "fallback": "hf_generate"},
@@ -606,9 +597,7 @@ def run_dflash_sample(
 
     target_for_dflash = _resolve_verifier_for_dflash(verifier_model)
     stop_token_ids = _resolve_stop_token_ids(stop, tokenizer)
-    input_ids = torch.tensor(
-        [prompt_tokens], device=verifier_device, dtype=torch.long
-    )
+    input_ids = torch.tensor([prompt_tokens], device=verifier_device, dtype=torch.long)
     prompt_len = input_ids.shape[1]
 
     if seed is not None:

@@ -102,9 +102,7 @@ def test_spec_decoding_request_all_defaults():
 
 
 def test_spec_decoding_request_full():
-    req = SpeculativeDecodingRequest(
-        enable=True, backend="dflash", max_draft_tokens=4, strict=True
-    )
+    req = SpeculativeDecodingRequest(enable=True, backend="dflash", max_draft_tokens=4, strict=True)
     assert req.enable is True
     assert req.backend == "dflash"
     assert req.max_draft_tokens == 4
