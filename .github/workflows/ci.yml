@@ -132,6 +132,44 @@ jobs:
       - name: Import smoke test
         run: python -c "import hatchery.core"
 
+  venvstacks:
+    name: Venvstacks build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-venvstacks-build')
+    runs-on: ubuntu-latest-m
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install build tooling
+        run: uv pip install --system build
+
+      - name: Build Hatchery wheel for stack
+        run: python -m build --wheel --outdir packaging/venvstacks/wheelhouse
+
+      - name: Show Venvstacks plan
+        run: uvx --from venvstacks venvstacks show packaging/venvstacks/venvstacks.toml
+
+      - name: Relock app layers against local wheel
+        run: |
+          uvx --from venvstacks venvstacks lock \
+            --local-wheels wheelhouse \
+            --reset-lock "app-*" \
+            packaging/venvstacks/venvstacks.toml
+
+      - name: Build Venvstacks environments
+        run: |
+          uvx --from venvstacks venvstacks build \
+            --local-wheels wheelhouse \
+            --include-dependencies \
+            packaging/venvstacks/venvstacks.toml
+
   gpu:
     name: GPU tests
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-gpu-tests')
