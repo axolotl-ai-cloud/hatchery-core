@@ -51,6 +51,7 @@ from hatchery.core.protocols import (
     SessionRecord,
     SessionStatus,
 )
+from hatchery.core.spec_decoding import SpeculativeDecodingRequest
 
 router = APIRouter(prefix="/api/v1", tags=["tinker-compat"])
 
@@ -284,6 +285,8 @@ class SamplingParams(BaseModel):
     temperature: float = Field(1.0, ge=0.0, le=100.0)
     top_k: int = Field(-1, ge=-1, le=1000)
     top_p: float = Field(1.0, gt=0.0, le=1.0)
+    speculative_decoding: Optional[SpeculativeDecodingRequest] = None
+    enable_thinking: Optional[bool] = None
 
 
 class SampleRequest(BaseModel):
@@ -1468,6 +1471,12 @@ async def asample(
         "include_prompt_logprobs": bool(req.prompt_logprobs),
         "topk_prompt_logprobs": int(req.topk_prompt_logprobs or 0),
     }
+    if req.sampling_params.speculative_decoding is not None:
+        sample_payload["speculative_decoding"] = (
+            req.sampling_params.speculative_decoding.model_dump(exclude_none=True)
+        )
+    if req.sampling_params.enable_thinking is not None:
+        sample_payload["enable_thinking"] = req.sampling_params.enable_thinking
     if _model_input_has_images(req.prompt):
         sample_payload["images"] = _decode_image_chunks(req.prompt)
     pre_op_ctx = await run_pre_op_hooks(config, session, user, "sample", sample_payload)
