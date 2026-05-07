@@ -125,6 +125,11 @@ def main() -> None:
         trainer.load_state("fsdp2-smoke", state)
 
         data = _build_data(args.base_model)
+        pre_sample = trainer.sample(
+            "fsdp2-smoke",
+            data[0]["input_ids"][:4],
+            {"max_tokens": 2, "temperature": 0.0},
+        )
         losses: list[float] = []
         for _ in range(args.steps):
             result = trainer.forward_backward("fsdp2-smoke", data, "cross_entropy")
@@ -139,6 +144,11 @@ def main() -> None:
                     "weight_decay": 0.0,
                 },
             )
+        post_sample = trainer.sample(
+            "fsdp2-smoke",
+            data[0]["input_ids"][:4],
+            {"max_tokens": 2, "temperature": 0.0},
+        )
 
         runtime = trainer._distributed_runtime
         if runtime.global_rank == 0:
@@ -151,6 +161,8 @@ def main() -> None:
                     "last_loss": losses[-1],
                     "losses": losses,
                     "losses_decreased": losses[-1] < losses[0],
+                    "pre_sample_tokens": pre_sample.total_tokens,
+                    "post_sample_tokens": post_sample.total_tokens,
                 },
             )
     except Exception as exc:  # noqa: BLE001

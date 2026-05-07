@@ -99,3 +99,5 @@ def test_fsdp2_smoke_vanilla_trainer(tmp_path):
     assert result["status"] == "ok", result.get("error")
     assert result["world_size"] == 2
     assert result["losses_decreased"], result
+    assert result["pre_sample_tokens"] > 0
+    assert result["post_sample_tokens"] > 0
