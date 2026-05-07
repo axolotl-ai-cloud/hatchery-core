@@ -146,7 +146,11 @@ def resolve_dflash_policy(
             )
         return False, meta
 
-    max_draft = spec_request.max_draft_tokens or dflash_config.max_draft_tokens
+    max_draft = (
+        spec_request.max_draft_tokens
+        if spec_request.max_draft_tokens is not None
+        else dflash_config.max_draft_tokens
+    )
     meta.draft_model = dflash_config.draft_model
     meta.max_draft_tokens = max_draft
 
@@ -272,16 +276,18 @@ def run_dflash_sample(
         return None, meta
 
     input_ids = torch.tensor([prompt_tokens], device=device, dtype=torch.long)
+    # Apply the same temperature floor as the HF generate path: avoids
+    # div-by-zero in draft sampling when temperature=0.0 (greedy).
+    safe_temperature = max(temperature, 1e-5)
     t_start = time.monotonic()
     try:
-
         generate_kwargs: dict[str, Any] = dict(
             verifier=verifier_model,
             draft=meta.draft_model,
             tokenizer=tokenizer,
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
-            temperature=temperature,
+            temperature=safe_temperature,
             top_p=top_p,
             max_draft_tokens=meta.max_draft_tokens,
         )
@@ -301,6 +307,8 @@ def run_dflash_sample(
         acceptance_rate: Optional[float] = None
         if isinstance(raw_output, dict):
             acceptance_rate = raw_output.get("acceptance_rate")
+        else:
+            acceptance_rate = getattr(raw_output, "acceptance_rate", None)
         logger.info(
             "dflash.sample_complete",
             extra={

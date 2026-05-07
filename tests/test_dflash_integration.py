@@ -534,7 +534,7 @@ async def test_handle_sample_dflash_fallback_on_runtime_error():
 
 @pytest.mark.asyncio
 async def test_handle_sample_dflash_fallback_no_config():
-    """Without DFlashConfig, speculative_decoding in payload is silently ignored."""
+    """Without DFlashConfig, client gets spec_decoding_metadata with fallback_reason."""
     dflash_mod = _make_dflash_module()
     w = _make_minimal_worker_for_sample(dflash_cfg=None)
 
@@ -547,9 +547,51 @@ async def test_handle_sample_dflash_fallback_no_config():
     with patch.dict(sys.modules, {"dflash": dflash_mod}):
         result, metrics = await w._handle_sample("sess-1", payload)
 
-    # DFlash module not consulted — config is None so isinstance check fails
+    # DFlash module not consulted — config is None
     assert dflash_mod.generate.call_count == 0
     assert "sequences" in result
+    # B2 fix: metadata is present so the client knows DFlash was disabled
+    assert result["spec_decoding_metadata"]["fallback_reason"] == "dflash_disabled"
+
+
+@pytest.mark.asyncio
+async def test_handle_sample_dflash_skipped_when_prompt_logprobs_requested():
+    """DFlash is skipped when prompt_logprobs are requested (M3: bypass prevention)."""
+    dflash_mod = _make_dflash_module()
+    cfg = _make_dflash_config()
+    w = _make_minimal_worker_for_sample(dflash_cfg=cfg)
+
+    payload = {
+        "prompt_tokens": [1, 2],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "include_prompt_logprobs": True,
+        "speculative_decoding": {"enable": True},
+    }
+    with patch.dict(sys.modules, {"dflash": dflash_mod}):
+        result, metrics = await w._handle_sample("sess-1", payload)
+
+    # DFlash skipped — falls through to HF generate
+    assert dflash_mod.generate.call_count == 0
+    assert "sequences" in result
+    assert result["spec_decoding_metadata"]["fallback_reason"] == "prompt_logprobs_requested"
+
+
+@pytest.mark.asyncio
+async def test_handle_sample_malformed_spec_decoding_falls_back():
+    """Malformed speculative_decoding payload falls back to HF generate gracefully (B1)."""
+    w = _make_minimal_worker_for_sample(dflash_cfg=_make_dflash_config())
+    payload = {
+        "prompt_tokens": [1, 2],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        # max_draft_tokens=0 is below the ge=1 bound — will fail Pydantic validation
+        "speculative_decoding": {"enable": True, "max_draft_tokens": 0},
+    }
+    result, metrics = await w._handle_sample("sess-1", payload)
+    # Parse error is swallowed; vanilla HF path runs
+    assert "sequences" in result
+    assert "spec_backend" not in metrics
 
 
 @pytest.mark.asyncio

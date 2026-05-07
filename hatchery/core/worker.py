@@ -2506,38 +2506,66 @@ class GPUWorker:
         # includes a speculative_decoding option and the worker has a
         # DFlashConfig. Falls back to HF generate on any failure unless
         # strict mode is set in the per-request options.
+        #
+        # TODO(dflash): VLLMSamplingBackend path not yet wired. The same
+        # DFlashConfig should gate speculative decoding in hatchery-hosted's
+        # VLLMSamplingBackend once that hosted follow-up is implemented.
         spec_meta = None
         if payload.get("speculative_decoding") is not None:
             from hatchery.core.dflash_integration import (
                 DFlashConfig,
                 parse_spec_request,
+                resolve_dflash_policy,
                 run_dflash_sample,
             )
 
-            spec_request = parse_spec_request(payload)
-            dflash_cfg = getattr(self.config, "dflash", None)
-            if spec_request is not None and isinstance(dflash_cfg, DFlashConfig):
-                dflash_result, spec_meta = run_dflash_sample(
-                    verifier_model=model,
-                    tokenizer=self.tokenizer,
-                    prompt_tokens=prompt_tokens,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    n=n,
-                    seed=seed,
-                    stop=stop,
-                    spec_request=spec_request,
-                    dflash_config=dflash_cfg,
-                    device=self.device,
+            try:
+                spec_request = parse_spec_request(payload)
+            except Exception:  # noqa: BLE001 — malformed payload, treat as no-spec
+                spec_request = None
+                logger.warning(
+                    "spec_decoding.parse_error",
+                    extra={"payload_key": "speculative_decoding"},
+                    exc_info=True,
                 )
-                if dflash_result is not None:
-                    # DFlash generation succeeded — attach metadata and return.
-                    dflash_result["spec_decoding_metadata"] = _spec_meta_to_dict(spec_meta)
-                    total_tokens = sum(len(s) for s in dflash_result.get("sequences", []))
-                    return dflash_result, {"tokens": total_tokens, "spec_backend": "dflash"}
-                # spec_meta carries fallback_reason; fall through to HF generate.
+
+            dflash_cfg = getattr(self.config, "dflash", None)
+            if spec_request is not None:
+                if isinstance(dflash_cfg, DFlashConfig):
+                    # DFlash is configured — attempt speculative decoding.
+                    # Skip if prompt logprobs are also requested: DFlash's early
+                    # return bypasses the second forward pass that computes them.
+                    _needs_prompt_logprobs = include_prompt_logprobs or topk_prompt_logprobs > 0
+                    if _needs_prompt_logprobs:
+                        _, spec_meta = resolve_dflash_policy(spec_request, dflash_cfg)
+                        if spec_meta.requested_backend is not None:
+                            spec_meta.fallback_reason = "prompt_logprobs_requested"
+                    else:
+                        dflash_result, spec_meta = run_dflash_sample(
+                            verifier_model=model,
+                            tokenizer=self.tokenizer,
+                            prompt_tokens=prompt_tokens,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            n=n,
+                            seed=seed,
+                            stop=stop,
+                            spec_request=spec_request,
+                            dflash_config=dflash_cfg,
+                            device=self.device,
+                        )
+                        if dflash_result is not None:
+                            # DFlash generation succeeded — attach metadata and return.
+                            dflash_result["spec_decoding_metadata"] = _spec_meta_to_dict(spec_meta)
+                            total_tokens = sum(len(s) for s in dflash_result.get("sequences", []))
+                            return dflash_result, {"tokens": total_tokens, "spec_backend": "dflash"}
+                        # spec_meta carries fallback_reason; fall through to HF generate.
+                else:
+                    # DFlash not configured on this worker — record this so the
+                    # client can see the request was noted but not fulfilled.
+                    _, spec_meta = resolve_dflash_policy(spec_request, None)
 
         do_sample = temperature > 0 and (temperature != 1.0 or top_p != 1.0 or n > 1)
         if temperature == 0.0:

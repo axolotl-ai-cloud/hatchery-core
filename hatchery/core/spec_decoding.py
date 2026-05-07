@@ -30,9 +30,14 @@ SPEC_BACKEND_DFLASH = "dflash"
 class SpeculativeDecodingRequest(BaseModel):
     """Request-level speculative decoding preferences.
 
-    All fields are optional. Omitting them defers to the server's configured
-    default policy. Setting ``enable=False`` explicitly disables speculative
-    decoding for this request regardless of server defaults.
+    All fields are optional. Omitting them (or setting ``enable=None``) defers
+    to the server's configured default policy: if the server has a DFlash draft
+    model configured, the request will use speculative decoding automatically.
+    Setting ``enable=False`` explicitly disables speculative decoding for this
+    request regardless of server defaults. Setting ``enable=True`` is equivalent
+    to ``None`` for DFlash (server config still gates eligibility) but will
+    trigger ``fallback_reason`` in the response metadata if DFlash is not
+    configured, making the intent visible to the caller.
     """
 
     enable: Optional[bool] = None
