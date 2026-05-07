@@ -117,6 +117,22 @@ Script helper:
 HATCHERY_BASE_MODEL=Qwen/Qwen2-0.5B ./hatchery/core/scripts/run_worker.sh
 ```
 
+### Optional DFlash Speculative Decoding
+
+Workers can use [DFlash](https://github.com/z-lab/dflash) for speculative
+decoding on supported model/draft-adapter pairs. Install DFlash explicitly in
+worker environments that configure `DFlashConfig`; it is not a `hatchery-core`
+extra because public PyPI rejects published packages with direct Git
+dependencies in their metadata.
+
+```bash
+uv pip install 'dflash[transformers] @ git+https://github.com/z-lab/dflash.git@4febcb4b32824a39fc683c9b74d193f885d9fe19'
+```
+
+If DFlash is absent, non-strict speculative-decoding requests fall back to the
+standard Hugging Face generation path. Strict requests raise so image smoke
+tests can detect a missing dependency.
+
 Multi-process torchrun:
 
 ```bash
