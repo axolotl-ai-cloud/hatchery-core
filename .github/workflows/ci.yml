@@ -156,7 +156,7 @@ jobs:
         run: |
           python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2-0.5B')"
 
-      - name: Run GPU tests (additive: only gpu/distributed-marked tests)
+      - name: "Run GPU tests (additive: only gpu/distributed-marked tests)"
         env:
           HF_HOME: ${{ runner.temp }}/hf_home
           CUDA_VISIBLE_DEVICES: "0,1"
