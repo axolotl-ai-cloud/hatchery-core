@@ -20,6 +20,8 @@ import os
 
 import pytest
 
+pytestmark = [pytest.mark.gpu]
+
 torch = pytest.importorskip("torch")
 
 if not torch.cuda.is_available():

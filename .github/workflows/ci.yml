@@ -81,12 +81,11 @@ jobs:
           uv pip install --system transformers peft
           uv pip install --system -e ".[test]"
 
-      - name: Run CPU test suite
+      - name: Run CPU test suite (excludes gpu/distributed-marked tests)
         run: |
           CUDA_VISIBLE_DEVICES="" pytest \
-            --ignore=tests/torch_tests/test_worker_gpu.py \
-            --ignore=tests/torch_distributed \
-            -q
+            -m "not gpu and not distributed" \
+            -q -rs
 
   package:
     name: Package smoke test
@@ -157,9 +156,12 @@ jobs:
         run: |
           python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2-0.5B')"
 
-      - name: Run GPU tests
+      - name: Run GPU tests (additive: only gpu/distributed-marked tests)
         env:
           HF_HOME: ${{ runner.temp }}/hf_home
-          CUDA_VISIBLE_DEVICES: "0"
+          CUDA_VISIBLE_DEVICES: "0,1"
           TEST_DEVICE: cuda:0
-        run: pytest tests/torch_tests/ tests/torch_distributed/ -q --tb=short
+        run: |
+          pytest tests/torch_tests/ tests/torch_distributed/ \
+            -m "gpu or distributed" \
+            -q --tb=short -rs

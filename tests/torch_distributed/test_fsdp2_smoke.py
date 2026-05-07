@@ -52,8 +52,20 @@ def _has_bf16() -> bool:
         return False
 
 
+def _has_fsdp2_api() -> bool:
+    try:
+        from torch.distributed import fsdp
+
+        return hasattr(fsdp, "fully_shard")
+    except Exception:
+        return False
+
+
 pytestmark = [
     pytest.mark.gpu,
+    pytest.mark.distributed,
+    pytest.mark.fsdp2,
+    pytest.mark.skipif(not _has_fsdp2_api(), reason="torch FSDP2 fully_shard API unavailable"),
     pytest.mark.skipif(_gpu_count() < 2, reason="need >= 2 CUDA devices"),
     pytest.mark.skipif(not _has_torchrun(), reason="torchrun not on PATH"),
     pytest.mark.skipif(not _has_bf16(), reason="bf16 not supported (dist scripts require it)"),

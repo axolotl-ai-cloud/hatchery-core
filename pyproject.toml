@@ -79,6 +79,8 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "gpu: tests that require a real CUDA device",
+    "distributed: tests that require a distributed (multi-process) torch environment",
+    "fsdp2: tests that exercise the FSDP2 data-parallel code path",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
