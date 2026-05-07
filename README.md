@@ -55,6 +55,17 @@ For GPU machines, PyTorch wheel selection still comes from your package manager 
 uv pip install -e '.[gpu,test,examples]'
 ```
 
+### Optional DFlash Support
+
+Hatchery can use [DFlash](https://github.com/z-lab/dflash) for speculative decoding on supported model/draft-adapter pairs. DFlash is not declared as a `hatchery-core` package extra because public PyPI rejects packages whose published metadata contains direct Git dependencies. Install it explicitly in worker images or local environments that enable DFlash:
+
+```bash
+uv pip install -e '.[gpu,test,examples]'
+uv pip install 'dflash[transformers] @ git+https://github.com/z-lab/dflash.git@4febcb4b32824a39fc683c9b74d193f885d9fe19'
+```
+
+Without DFlash installed, non-strict speculative-decoding requests fall back to the normal Hugging Face generation path. Strict requests raise so deployment smoke tests can catch a missing dependency.
+
 ## Quick Start
 
 Start the local dev server:

@@ -1,5 +1,6 @@
 .idea
 .claude
+.scratch
 *.egg-info
 .env
 .env.*
