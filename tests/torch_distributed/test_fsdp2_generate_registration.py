@@ -6,6 +6,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+pytestmark = [pytest.mark.fsdp2]
+
 from hatchery.core.distributed import DistributedRuntime, apply_core_fsdp2_dp
 from hatchery.core.parallel import ParallelConfig
 

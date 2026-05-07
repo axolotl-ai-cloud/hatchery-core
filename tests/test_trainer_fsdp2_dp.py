@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = [pytest.mark.fsdp2]
+
 torch = pytest.importorskip("torch")
 
 
