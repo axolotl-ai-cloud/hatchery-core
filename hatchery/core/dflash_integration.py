@@ -38,6 +38,11 @@ counterparts). DFlash's transformers backend reaches into ``target.model`` and
 ``target.lm_head``, so we forward the LoRA-augmented inner causal LM rather
 than the outer PEFT wrapper. Verifier outputs still reflect the trained
 adapters because the in-place LoRA modules participate in every forward pass.
+
+Model-aware draft selection: if the worker config does not name an explicit
+draft model, the policy can infer a known draft from the verifier base model
+name. That keeps the Qwen3.6 DFlash path ergonomic while preserving the
+existing disable/strict behavior.
 """
 
 from __future__ import annotations
@@ -61,6 +66,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("hatchery.core.dflash_integration")
 
+_DEFAULT_DFLASH_DRAFT_MODELS: dict[str, str] = {
+    "Qwen/Qwen3.6-35B-A3B": "z-lab/Qwen3.6-35B-A3B-DFlash",
+}
+
 
 @dataclass
 class DFlashConfig:
@@ -75,10 +84,8 @@ class DFlashConfig:
     Attributes
     ----------
     draft_model:
-        HF model name or local path for the draft model. *Required* — without
-        it, DFlash is skipped regardless of per-request opts. The draft is
-        loaded with ``trust_remote_code=True`` because z-lab's draft repos
-        ship custom modeling code.
+        HF model name or local path for the draft model. When omitted, the
+        policy can infer a known draft for supported verifier base models.
     max_draft_tokens:
         Default maximum draft tokens per speculation step (per-request
         ``max_draft_tokens`` overrides this). Forwarded to dflash as the
@@ -140,6 +147,15 @@ def _resolve_dflash_generate(dflash_mod: Any) -> tuple[Any, bool]:
     return fn, is_real
 
 
+def _resolve_default_draft_model(base_model_name: Optional[str]) -> Optional[str]:
+    if base_model_name is None:
+        return None
+    for prefix, draft_model in _DEFAULT_DFLASH_DRAFT_MODELS.items():
+        if base_model_name == prefix or base_model_name.startswith(prefix):
+            return draft_model
+    return None
+
+
 def parse_spec_request(payload: dict) -> Optional[SpeculativeDecodingRequest]:
     """Extract and validate the ``speculative_decoding`` entry from a sample payload.
 
@@ -157,6 +173,8 @@ def parse_spec_request(payload: dict) -> Optional[SpeculativeDecodingRequest]:
 def resolve_dflash_policy(
     spec_request: Optional[SpeculativeDecodingRequest],
     dflash_config: Optional[DFlashConfig],
+    *,
+    base_model_name: Optional[str] = None,
 ) -> tuple[bool, SpeculativeDecodingMetadata]:
     """Decide whether a sample request should use DFlash speculative decoding.
 
@@ -199,7 +217,8 @@ def resolve_dflash_policy(
             raise ValueError("DFlash is disabled on this worker but strict mode was requested")
         return False, meta
 
-    if not dflash_config.draft_model:
+    draft_model = dflash_config.draft_model or _resolve_default_draft_model(base_model_name)
+    if not draft_model:
         meta.fallback_reason = "no_draft_model_configured"
         if spec_request.strict:
             raise ValueError(
@@ -212,7 +231,7 @@ def resolve_dflash_policy(
         if spec_request.max_draft_tokens is not None
         else dflash_config.max_draft_tokens
     )
-    meta.draft_model = dflash_config.draft_model
+    meta.draft_model = draft_model
     meta.max_draft_tokens = max_draft
 
     return True, meta
@@ -455,6 +474,7 @@ def run_dflash_sample(
     spec_request: SpeculativeDecodingRequest,
     dflash_config: DFlashConfig,
     device: Any,
+    base_model_name: Optional[str] = None,
 ) -> tuple[Optional[dict], SpeculativeDecodingMetadata]:
     """Attempt DFlash speculative decoding; return normalized result or fallback signal.
 
@@ -503,7 +523,11 @@ def run_dflash_sample(
     ValueError from :func:`resolve_dflash_policy` (or the n>1 / top_p / top_k
     surface fallbacks below) when strict mode is True.
     """
-    should_use, meta = resolve_dflash_policy(spec_request, dflash_config)
+    should_use, meta = resolve_dflash_policy(
+        spec_request,
+        dflash_config,
+        base_model_name=base_model_name,
+    )
     if not should_use:
         return None, meta
 

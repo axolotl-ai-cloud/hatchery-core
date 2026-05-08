@@ -227,6 +227,7 @@ class GPUWorker:
         # wrote the most recent state ourselves — no other worker can
         # have advanced past us within the sticky affinity window.
         self._self_saved_versions: dict[str, tuple[int, int]] = {}
+        self._runtime_optimizations: dict[str, Any] = {}
 
         # Per-full-param-session base weights, kept on CPU. Keyed by
         # session_id so the same set of snapshots survives multi-model
@@ -353,6 +354,24 @@ class GPUWorker:
                 )
             slot.precision_applied = True
 
+        apply_runtime_optimizations = getattr(
+            self.config,
+            "apply_runtime_model_optimizations",
+            None,
+        )
+        if callable(apply_runtime_optimizations):
+            self._runtime_optimizations = apply_runtime_optimizations(
+                self._raw_base,
+                base_model_name=self.base_model_name,
+                lora_config=None,
+            )
+            if self._runtime_optimizations:
+                logger.info(
+                    "worker.runtime_model_optimizations_applied",
+                    model=self.base_model_name,
+                    optimizations=self._runtime_optimizations,
+                )
+
         # NOTE: FSDP2 wrapping is deferred until after the first PEFT
         # adapter is attached in _attach_adapter. Wrapping here (before
         # PEFT) converts q_proj.weight into a DTensor whose ``out_features``
@@ -389,6 +408,7 @@ class GPUWorker:
             max_concurrent_loras=self._cache.max_slots,
             vram_free_mb=self._vram_free_mb(),
             cp_degree=self.parallel.cp_degree,
+            runtime_optimizations=dict(self._runtime_optimizations),
         )
         register = getattr(self.config.compute, "register_worker", None)
         if register is not None:
@@ -2494,6 +2514,7 @@ class GPUWorker:
         model = self._activate_session(session_id, runtime)
         assert self.tokenizer is not None
         model.eval()
+        base_model_name = getattr(self, "base_model_name", None)
 
         prompt_tokens = payload["prompt_tokens"]
         input_ids = torch.tensor([prompt_tokens], device=self.device, dtype=torch.long)
@@ -2537,6 +2558,8 @@ class GPUWorker:
                 )
 
             dflash_cfg = getattr(self.config, "dflash", None)
+            if spec_request is not None and spec_request.enable is False:
+                spec_request = None
             if spec_request is not None:
                 if isinstance(dflash_cfg, DFlashConfig):
                     # DFlash is configured — attempt speculative decoding.
@@ -2544,7 +2567,11 @@ class GPUWorker:
                     # return bypasses the second forward pass that computes them.
                     _needs_prompt_logprobs = include_prompt_logprobs or topk_prompt_logprobs > 0
                     if _needs_prompt_logprobs:
-                        _, spec_meta = resolve_dflash_policy(spec_request, dflash_cfg)
+                        _, spec_meta = resolve_dflash_policy(
+                            spec_request,
+                            dflash_cfg,
+                            base_model_name=base_model_name,
+                        )
                         if spec_meta.requested_backend is not None:
                             spec_meta.fallback_reason = "prompt_logprobs_requested"
                     else:
@@ -2562,6 +2589,7 @@ class GPUWorker:
                             spec_request=spec_request,
                             dflash_config=dflash_cfg,
                             device=self.device,
+                            base_model_name=base_model_name,
                         )
                         if dflash_result is not None:
                             # DFlash generation succeeded — attach metadata and return.
@@ -2572,7 +2600,11 @@ class GPUWorker:
                 else:
                     # DFlash not configured on this worker — record this so the
                     # client can see the request was noted but not fulfilled.
-                    _, spec_meta = resolve_dflash_policy(spec_request, None)
+                    _, spec_meta = resolve_dflash_policy(
+                        spec_request,
+                        None,
+                        base_model_name=base_model_name,
+                    )
 
         do_sample = temperature > 0 and (temperature != 1.0 or top_p != 1.0 or n > 1)
         if temperature == 0.0:

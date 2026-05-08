@@ -140,6 +140,18 @@ def test_policy_no_draft_model_returns_false_with_fallback_reason():
     assert meta.fallback_reason == "no_draft_model_configured"
 
 
+def test_policy_qwen36_base_model_infers_known_draft():
+    req = _make_spec_request()
+    cfg = DFlashConfig(draft_model=None)
+    should_use, meta = resolve_dflash_policy(
+        req,
+        cfg,
+        base_model_name="Qwen/Qwen3.6-35B-A3B",
+    )
+    assert should_use is True
+    assert meta.draft_model == "z-lab/Qwen3.6-35B-A3B-DFlash"
+
+
 def test_policy_strict_no_config_raises():
     req = SpeculativeDecodingRequest(enable=True, strict=True)
     with pytest.raises(ValueError, match="disabled"):
@@ -199,6 +211,7 @@ def _run_sample_no_dflash(**extra_kwargs: Any):
         spec_request=_make_spec_request(),
         dflash_config=_make_dflash_config(),
         device="cpu",
+        base_model_name="Qwen/Qwen3.6-35B-A3B",
         **extra_kwargs,
     )
 
@@ -229,6 +242,7 @@ def test_run_dflash_sample_not_installed_strict_raises(monkeypatch):
             spec_request=SpeculativeDecodingRequest(enable=True, strict=True),
             dflash_config=_make_dflash_config(),
             device="cpu",
+            base_model_name="Qwen/Qwen3.6-35B-A3B",
         )
 
 
@@ -301,6 +315,17 @@ def test_run_dflash_sample_passes_draft_model():
     assert call_kwargs["draft"] == "org/small-draft"
 
 
+def test_run_dflash_sample_infers_qwen36_draft_model():
+    dflash_mod = _make_dflash_module()
+    _run_sample_with_mock_dflash(
+        dflash_mod,
+        dflash_config=DFlashConfig(draft_model=None),
+        base_model_name="Qwen/Qwen3.6-35B-A3B",
+    )
+    call_kwargs = dflash_mod.generate.call_args[1]
+    assert call_kwargs["draft"] == "z-lab/Qwen3.6-35B-A3B-DFlash"
+
+
 def test_run_dflash_sample_passes_max_draft_tokens():
     req = SpeculativeDecodingRequest(enable=True, max_draft_tokens=7)
     dflash_mod = _make_dflash_module()
@@ -336,6 +361,27 @@ def test_run_dflash_sample_policy_mismatch_returns_none():
     req = SpeculativeDecodingRequest(enable=False)
     result, meta = _run_sample_with_mock_dflash(dflash_mod, spec_request=req)
     assert result is None
+    assert dflash_mod.generate.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_sample_explicit_disable_skips_qwen36_dflash():
+    """Explicit enable=False must not force the Qwen3.6 DFlash draft mapping."""
+    dflash_mod = _make_dflash_module()
+    cfg = _make_dflash_config(draft_model=None)
+    w = _make_minimal_worker_for_sample(dflash_cfg=cfg)
+
+    payload = {
+        "prompt_tokens": [1, 2],
+        "max_tokens": 8,
+        "temperature": 1.0,
+        "speculative_decoding": {"enable": False},
+    }
+    with patch.dict(sys.modules, {"dflash": dflash_mod}):
+        result, metrics = await w._handle_sample("sess-1", payload)
+
+    assert "spec_decoding_metadata" not in result
+    assert "spec_backend" not in metrics
     assert dflash_mod.generate.call_count == 0
 
 

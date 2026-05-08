@@ -20,7 +20,7 @@ import logging
 import os
 import secrets
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from hatchery.core.protocols import (
     AuthProvider,
@@ -122,6 +122,22 @@ class Config:
         from hatchery.core.session_store import LocalSessionStateStore
 
         return LocalSessionStateStore(local=local, remote=self.objects)
+
+    def apply_runtime_model_optimizations(
+        self,
+        model: Any,
+        *,
+        base_model_name: str,
+        lora_config: Any = None,
+    ) -> dict[str, Any]:
+        """Best-effort hook for extension packages to patch model runtime behavior.
+
+        Core leaves the model unchanged. Hosted installs can override this to
+        apply optional, lazy-loaded kernel paths such as ScatterMoE-LoRA.
+        The return value is surfaced in worker registration metadata so
+        operators can see which optional paths were selected.
+        """
+        return {}
 
 
 def build_core_config() -> Config:
