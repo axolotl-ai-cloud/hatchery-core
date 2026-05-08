@@ -459,6 +459,58 @@ def _normalize_dflash_output(
     return out
 
 
+def _completion_logprobs(
+    verifier_model: Any,
+    *,
+    prompt_tokens: list[int],
+    sequences: list[list[int]],
+    device: Any,
+) -> list[list[float]]:
+    """Score DFlash completions with the verifier model.
+
+    Tinker's sample response carries one rollout-policy logprob per generated
+    token. DFlash currently returns token IDs and acceptance stats, so we run a
+    no-grad verifier pass over prompt+completion to recover the same
+    completion logprobs the standard HF generate path exposes.
+    """
+    if not sequences:
+        return []
+
+    model_config = getattr(verifier_model, "config", None)
+    pad_id = int(
+        getattr(model_config, "pad_token_id", None)
+        or getattr(model_config, "eos_token_id", 0)
+        or 0
+    )
+    max_len = max(len(prompt_tokens) + len(sequence) for sequence in sequences)
+    rows: list[list[int]] = []
+    for sequence in sequences:
+        row = [int(token) for token in prompt_tokens] + [int(token) for token in sequence]
+        rows.append(row + [pad_id] * (max_len - len(row)))
+
+    input_ids = torch.tensor(rows, device=device, dtype=torch.long)
+    attention_mask = torch.zeros_like(input_ids)
+    for row_idx, sequence in enumerate(sequences):
+        attention_mask[row_idx, : len(prompt_tokens) + len(sequence)] = 1
+
+    with torch.no_grad():
+        outputs = verifier_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        log_probs = torch.nn.functional.log_softmax(outputs.logits.float(), dim=-1)
+
+    out: list[list[float]] = []
+    start = max(len(prompt_tokens) - 1, 0)
+    for row_idx, sequence in enumerate(sequences):
+        row: list[float] = []
+        for offset, token in enumerate(sequence):
+            row.append(float(log_probs[row_idx, start + offset, int(token)].detach().cpu()))
+        out.append(row)
+    return out
+
+
 def run_dflash_sample(
     *,
     verifier_model: Any,
@@ -674,6 +726,25 @@ def run_dflash_sample(
         result = _normalize_dflash_output(
             raw_output, prompt_len=prompt_len, tokenizer=tokenizer, stop_token_ids=stop_token_ids
         )
+        sequences = [
+            [int(token) for token in sequence]
+            for sequence in result.get("sequences") or []
+        ]
+        sequence_logprobs = result.get("sequence_logprobs")
+        if (
+            not sequence_logprobs
+            or len(sequence_logprobs) != len(sequences)
+            or any(
+                len(row) != len(sequence)
+                for row, sequence in zip(sequence_logprobs, sequences, strict=False)
+            )
+        ):
+            result["sequence_logprobs"] = _completion_logprobs(
+                verifier_model,
+                prompt_tokens=prompt_tokens,
+                sequences=sequences,
+                device=verifier_device,
+            )
 
         logger.info(
             "dflash.sample_complete",

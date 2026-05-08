@@ -295,6 +295,25 @@ def test_run_dflash_sample_success():
     assert meta.fallback_reason is None
 
 
+def test_run_dflash_sample_scores_missing_logprobs():
+    dflash_mod = _make_dflash_module(
+        generate_return={
+            "sequences": [[4, 5]],
+            "texts": ["4 5"],
+            "stop_reasons": ["length"],
+        }
+    )
+    verifier = _FakePEFTModel()
+
+    result, meta = _run_sample_with_mock_dflash(dflash_mod, verifier_model=verifier)
+
+    assert result is not None
+    assert result["sequences"] == [[4, 5]]
+    assert len(result["sequence_logprobs"]) == 1
+    assert len(result["sequence_logprobs"][0]) == 2
+    assert meta.used_backend == SPEC_BACKEND_DFLASH
+
+
 def test_run_dflash_sample_calls_generate_with_verifier(monkeypatch):
     """The PEFT-wrapped verifier is forwarded to dflash.generate() as-is."""
     verifier = MagicMock(name="peft_wrapped_model")
