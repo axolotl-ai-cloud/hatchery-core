@@ -2218,5 +2218,6 @@ def _wrap_future_result(operation: str, payload: dict) -> dict:
             "prompt_logprobs": payload.get("prompt_logprobs"),
             "topk_prompt_logprobs": payload.get("topk_prompt_logprobs"),
             "spec_decoding_metadata": payload.get("spec_decoding_metadata"),
+            "profile": payload.get("profile"),
         }
     return payload
