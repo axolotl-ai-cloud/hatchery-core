@@ -34,8 +34,10 @@ from hatchery.core.parallel import ParallelConfig
 from hatchery.core.quantization import (
     QuantConfig,
     detect_quant_scheme,
+    is_fp8_torchao_model,
     is_onebit_by_name,
     is_onebit_model,
+    prepare_fp8_torchao_loader_kwargs,
     prepare_onebit_loader_kwargs,
     resolve_quant_scheme,
 )
@@ -49,6 +51,20 @@ def test_quant_config_defaults_are_noop():
     assert q.force is False
     assert q.require_full_param is True
     assert q.is_onebit is False
+
+
+def test_quant_config_fp8_torchao():
+    q = QuantConfig(scheme="fp8_torchao")
+    assert q.is_fp8_torchao is True
+    assert q.is_onebit is False
+    assert q.scheme == "fp8_torchao"
+
+
+def test_quant_config_fp8_torchao_modes():
+    assert QuantConfig(scheme="fp8_torchao", fp8_mode="weight_only").fp8_mode == "weight_only"
+    assert QuantConfig(scheme="fp8_torchao", fp8_mode="dynamic").fp8_mode == "dynamic"
+    with pytest.raises(ValueError):
+        QuantConfig(scheme="fp8_torchao", fp8_mode="int8")
 
 
 def test_quant_config_rejects_unknown_scheme():
@@ -75,6 +91,28 @@ def test_parallel_config_from_env(monkeypatch):
     assert p.quant.scheme == "onebit"
     assert p.quant.force is True
     assert p.quant.require_full_param is False
+
+
+def test_parallel_config_fp8_torchao_from_env(monkeypatch):
+    monkeypatch.setenv("HATCHERY_QUANT_SCHEME", "fp8_torchao")
+    monkeypatch.setenv("HATCHERY_FP8_MODE", "dynamic")
+    p = ParallelConfig.from_env()
+    assert p.quant.scheme == "fp8_torchao"
+    assert p.quant.fp8_mode == "dynamic"
+    assert p.quant.is_fp8_torchao is True
+
+
+def test_parallel_config_fp8_mode_defaults_to_weight_only(monkeypatch):
+    monkeypatch.setenv("HATCHERY_QUANT_SCHEME", "fp8_torchao")
+    p = ParallelConfig.from_env()
+    assert p.quant.fp8_mode == "weight_only"
+
+
+def test_parallel_config_fp8_mode_unknown_degrades_silently(monkeypatch):
+    monkeypatch.setenv("HATCHERY_QUANT_SCHEME", "fp8_torchao")
+    monkeypatch.setenv("HATCHERY_FP8_MODE", "int8_bogus")
+    p = ParallelConfig.from_env()
+    assert p.quant.fp8_mode == "weight_only"
 
 
 def test_parallel_config_from_env_rejects_unknown_scheme_silently(monkeypatch):
@@ -160,6 +198,53 @@ def test_resolve_defaults_to_none_without_signals():
     assert resolve_quant_scheme(_cfg(model_type="llama")) == "none"
 
 
+# ── FP8 TorchAO detection ─────────────────────────────────────────────
+
+
+def test_detect_fp8_torchao_from_quantization_config_dict():
+    """A serialised config.json with quant_type=torchao + Float8 is detected."""
+    q_dict = {"quant_type": "torchao", "torchao_config": "Float8WeightOnlyConfig()"}
+    assert is_fp8_torchao_model(_cfg(quantization_config=q_dict))
+
+
+def test_detect_fp8_torchao_from_quantization_config_object():
+    """A live TorchAoConfig object (duck-typed) is also detected."""
+
+    class _TorchAoCfg:
+        quant_type = "torchao"
+        torchao_config = "Float8DynamicActivationFloat8WeightConfig()"
+
+    assert is_fp8_torchao_model(_cfg(quantization_config=_TorchAoCfg()))
+
+
+def test_non_float8_torchao_not_detected_as_fp8():
+    """INT4/INT8 TorchAO configs must not be misidentified as FP8."""
+    q_int4 = {"quant_type": "torchao", "torchao_config": "Int4WeightOnlyConfig()"}
+    assert not is_fp8_torchao_model(_cfg(quantization_config=q_int4))
+
+
+def test_detect_quant_scheme_returns_fp8_torchao():
+    q = {"quant_type": "torchao", "torchao_config": "Float8WeightOnlyConfig()"}
+    assert detect_quant_scheme(_cfg(quantization_config=q)) == "fp8_torchao"
+
+
+def test_detect_quant_scheme_none_when_no_quant_config():
+    assert detect_quant_scheme(_cfg()) == "none"
+
+
+def test_resolve_silently_upgrades_to_fp8_torchao():
+    """A checkpoint already tagged fp8_torchao wins over a 'none' request."""
+    req = QuantConfig()  # scheme="none"
+    q = {"quant_type": "torchao", "torchao_config": "Float8WeightOnlyConfig()"}
+    assert resolve_quant_scheme(_cfg(quantization_config=q), requested=req) == "fp8_torchao"
+
+
+def test_resolve_force_overrides_fp8_detection():
+    req = QuantConfig(scheme="none", force=True)
+    q = {"quant_type": "torchao", "torchao_config": "Float8WeightOnlyConfig()"}
+    assert resolve_quant_scheme(_cfg(quantization_config=q), requested=req) == "none"
+
+
 # ── Loader kwargs ──────────────────────────────────────────────────────
 
 
@@ -183,6 +268,108 @@ def test_prepare_onebit_kwargs_leaves_none_alone():
 def test_prepare_onebit_kwargs_preserves_other_kwargs():
     out = prepare_onebit_loader_kwargs({"attn_implementation": "sdpa"})
     assert out["attn_implementation"] == "sdpa"
+
+
+# ── FP8 TorchAO loader kwargs ──────────────────────────────────────────
+#
+# Key requirement: prepare_fp8_torchao_loader_kwargs must INJECT a
+# TorchAoConfig into the kwargs, NOT clear quantization_config like the
+# prior BF16 dequantize approach (task_01KR4CZCG3R4MEY62HFZYV1JKD).
+#
+# Tests with real imports are gated on torchao+transformers being present.
+# The mock-based test always runs and verifies the routing invariant.
+
+
+def test_fp8_torchao_loader_kwargs_inject_not_clear(monkeypatch):
+    """Routing invariant: FP8 loader injects TorchAoConfig, not clears quant config.
+
+    Uses mocks so this test always runs regardless of whether torchao /
+    transformers are installed.  The assertion is structural: the returned
+    kwargs must contain a non-None 'quantization_config' whose value was
+    produced by TorchAoConfig, not by clearing the field.
+    """
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    sentinel = object()  # unique — proves TorchAoConfig was called
+
+    mock_float8_cfg = object()
+    MockFloat8WeightOnlyConfig = MagicMock(return_value=mock_float8_cfg)
+    MockTorchAoConfig = MagicMock(return_value=sentinel)
+
+    mock_torchao_quant = MagicMock()
+    mock_torchao_quant.Float8WeightOnlyConfig = MockFloat8WeightOnlyConfig
+
+    mock_transformers = MagicMock()
+    mock_transformers.TorchAoConfig = MockTorchAoConfig
+
+    # prepare_fp8_torchao_loader_kwargs uses local `from X import Y` at
+    # call time, so patching sys.modules before the call is sufficient —
+    # no importlib.reload needed (reload mutates module state globally).
+    with patch.dict(
+        sys.modules,
+        {
+            "torchao": MagicMock(),
+            "torchao.quantization": mock_torchao_quant,
+            "transformers": mock_transformers,
+        },
+    ):
+        out = prepare_fp8_torchao_loader_kwargs(
+            {"torch_dtype": "auto", "attn_implementation": "sdpa"}, fp8_mode="weight_only"
+        )
+
+    # Must set quantization_config to the sentinel produced by TorchAoConfig.
+    assert out["quantization_config"] is sentinel
+    # TorchAoConfig must have been called with the Float8WeightOnlyConfig instance.
+    MockTorchAoConfig.assert_called_once_with(mock_float8_cfg)
+    # Other kwargs survive unchanged.
+    assert out["attn_implementation"] == "sdpa"
+
+
+def test_fp8_torchao_loader_kwargs_dynamic_mode(monkeypatch):
+    """dynamic fp8_mode routes to Float8DynamicActivationFloat8WeightConfig."""
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    sentinel_dynamic = object()
+    mock_dyn_cfg = object()
+    MockDynConfig = MagicMock(return_value=mock_dyn_cfg)
+    MockTorchAoConfig = MagicMock(return_value=sentinel_dynamic)
+
+    mock_torchao_quant = MagicMock()
+    mock_torchao_quant.Float8DynamicActivationFloat8WeightConfig = MockDynConfig
+    mock_transformers = MagicMock()
+    mock_transformers.TorchAoConfig = MockTorchAoConfig
+
+    with patch.dict(
+        sys.modules,
+        {
+            "torchao": MagicMock(),
+            "torchao.quantization": mock_torchao_quant,
+            "transformers": mock_transformers,
+        },
+    ):
+        out = prepare_fp8_torchao_loader_kwargs({"torch_dtype": "auto"}, fp8_mode="dynamic")
+
+    assert out["quantization_config"] is sentinel_dynamic
+    MockTorchAoConfig.assert_called_once_with(mock_dyn_cfg)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HATCHERY_FP8_INTEGRATION_TEST"),
+    reason="set HATCHERY_FP8_INTEGRATION_TEST=1 to run with real torchao+transformers",
+)
+def test_prepare_fp8_torchao_loader_kwargs_real_torchao_config():
+    """Integration test: real TorchAoConfig injected into kwargs."""
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "TorchAoConfig"):
+        pytest.skip("transformers.TorchAoConfig not available (upgrade to >= 4.46)")
+    pytest.importorskip("torchao")
+
+    out = prepare_fp8_torchao_loader_kwargs({"torch_dtype": "auto"}, fp8_mode="weight_only")
+    assert "quantization_config" in out
+    assert isinstance(out["quantization_config"], transformers.TorchAoConfig)
+    assert out["quantization_config"] is not None
 
 
 # ── Pool routing ───────────────────────────────────────────────────────
@@ -262,6 +449,30 @@ def test_pool_does_not_consult_autoconfig_for_llama_slugs():
     assert slot.quant_scheme == "none"
 
 
+def test_rewrap_pool_records_fp8_torchao_from_config():
+    """Pool detects fp8_torchao from a quantization_config on the loaded model."""
+
+    class _FakeBaseWithFP8Config:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.config = SimpleNamespace(
+                model_type="llama",
+                architectures=None,
+                quantization_config={
+                    "quant_type": "torchao",
+                    "torchao_config": "Float8WeightOnlyConfig()",
+                },
+                _name_or_path=name,
+            )
+
+    def loader(name: str) -> Any:
+        return _FakeBaseWithFP8Config(name)
+
+    pool = RewrapModelPool(max_slots=1, device="cpu", loader=loader)
+    slot = pool.get_or_load("meta-llama/Llama-3.1-8B-fp8")
+    assert slot.quant_scheme == "fp8_torchao"
+
+
 # ── Trainer policy ─────────────────────────────────────────────────────
 
 
@@ -305,6 +516,38 @@ def test_trainer_full_param_unaffected_on_onebit():
 
     trainer.attach_session("sess-1", LoraSpec.full_param())
     assert "sess-1" in trainer._specs
+
+
+def test_trainer_lora_allowed_on_fp8_torchao():
+    """FP8 TorchAO models must NOT trigger the LoRA-refusal guard.
+
+    Unlike BitNet ('onebit'), TorchAO FP8 uses autograd-compatible
+    forward/backward and PEFT LoRA is fully supported.  The guard must
+    never fire for scheme='fp8_torchao', regardless of require_full_param.
+    """
+    torch = pytest.importorskip("torch")  # noqa: F841
+    pytest.importorskip("transformers")
+    from hatchery.core.trainer import LoraSpec, VanillaTrainer
+
+    trainer = VanillaTrainer(
+        base_model_name="meta-llama/Llama-3.1-8B",
+        device="cpu",
+        parallel=ParallelConfig(quant=QuantConfig(scheme="fp8_torchao", force=True)),
+        load_model=False,
+    )
+    trainer._quant_scheme = "fp8_torchao"
+
+    # Guard must not raise RuntimeError("1-bit").
+    # A later PEFT / raw-base failure is fine — we're only testing the guard.
+    try:
+        trainer.attach_session(
+            "sess-fp8",
+            LoraSpec(rank=8, lora_alpha=16, target_modules=["q_proj"]),
+        )
+    except RuntimeError as exc:
+        assert "1-bit" not in str(exc), f"Guard incorrectly fired for fp8_torchao: {exc}"
+    except Exception:
+        pass  # any non-guard failure is acceptable here
 
 
 def test_trainer_lora_allowed_on_onebit_when_opted_in():

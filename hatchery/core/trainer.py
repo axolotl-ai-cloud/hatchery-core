@@ -279,10 +279,11 @@ class VanillaTrainer:
         # is attached — see attach_session for the "why".
         self._parallel_applied = False
 
-        # Quantization scheme of the loaded base ("none" | "onebit").
-        # Set by :meth:`_load_base`; consulted by
-        # :meth:`_attach_full_param_session` to enforce the
-        # LoRA-required policy for BitNet bases.
+        # Quantization scheme of the loaded base:
+        # "none" | "onebit" | "fp8_torchao"
+        # Set by :meth:`_load_base`.  "onebit" triggers the LoRA-
+        # restriction guard in :meth:`attach_session`; "fp8_torchao"
+        # does not — TorchAO FP8 supports PEFT LoRA natively.
         self._quant_scheme: str = "none"
 
         self._distributed_runtime = init_distributed_runtime(self.parallel)
@@ -298,8 +299,10 @@ class VanillaTrainer:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from hatchery.core.quantization import (
+            is_fp8_torchao_model,
             is_onebit_by_name,
             is_onebit_model,
+            prepare_fp8_torchao_loader_kwargs,
             prepare_onebit_loader_kwargs,
         )
 
@@ -307,13 +310,18 @@ class VanillaTrainer:
             "torch_dtype": self.dtype,
             "attn_implementation": self.attn_implementation,
         }
-        # 1-bit / BitNet routing. The trainer has a ``ParallelConfig``
-        # with an optional :class:`QuantConfig`; combined with the
-        # model name, this tells us whether to run the onebit loader
-        # path. Detection is cheap (no network) — only touches the
-        # slug — which keeps the full-precision common case fast.
         quant_cfg = self.parallel.quant
-        if quant_cfg.is_onebit or is_onebit_by_name(self.base_model_name):
+        # FP8 via TorchAO — training-compatible path (autograd-aware).
+        # Must be checked before onebit: a caller who explicitly sets
+        # fp8_torchao wins over name-based onebit heuristics.
+        if quant_cfg.is_fp8_torchao:
+            load_kwargs = prepare_fp8_torchao_loader_kwargs(
+                load_kwargs, fp8_mode=quant_cfg.fp8_mode
+            )
+            self._quant_scheme = "fp8_torchao"
+        # 1-bit / BitNet routing. Detection is cheap (no network) —
+        # only touches the slug — keeping the full-precision fast path.
+        elif quant_cfg.is_onebit or is_onebit_by_name(self.base_model_name):
             load_kwargs = prepare_onebit_loader_kwargs(load_kwargs)
             self._quant_scheme = "onebit"
         else:
@@ -328,11 +336,16 @@ class VanillaTrainer:
             p.requires_grad = False
 
         # Re-detect after load — the HF config on the real model is
-        # authoritative and may flip "none" → "onebit" if a hand-
-        # edited config didn't match the slug.
+        # authoritative.  May flip "none" → "onebit" for hand-edited
+        # configs that didn't match the slug, and may flip "none" →
+        # "fp8_torchao" for pre-quantized checkpoints loaded without an
+        # explicit HATCHERY_QUANT_SCHEME.
         real_cfg = getattr(self._raw_base, "config", None)
-        if real_cfg is not None and is_onebit_model(real_cfg, model_name=self.base_model_name):
-            self._quant_scheme = "onebit"
+        if real_cfg is not None:
+            if is_onebit_model(real_cfg, model_name=self.base_model_name):
+                self._quant_scheme = "onebit"
+            elif is_fp8_torchao_model(real_cfg):
+                self._quant_scheme = "fp8_torchao"
 
         # Snapshot the pristine base now, before any session can attach
         # a LoRA adapter or mutate weights. Stored CPU-side so it can

@@ -714,8 +714,22 @@ def _maybe_adjust_kwargs_for_quant(
     *itself* hints at a 1-bit checkpoint. For the common full-
     precision path we return ``kwargs`` unchanged, avoiding an extra
     HTTP / cache read per load.
+
+    FP8 TorchAO (``quant_config.is_fp8_torchao``) is handled first and
+    bypasses the AutoConfig round-trip — we inject ``TorchAoConfig``
+    directly from the caller's explicit request.
+
+    Note: checkpoints already saved with a TorchAO FP8 ``quantization_config``
+    in ``config.json`` are handled automatically by HuggingFace
+    Transformers during ``from_pretrained`` without any injection here.
+    This FP8 branch covers the *apply-at-load-time* case only (explicit
+    ``scheme="fp8_torchao"``).
     """
-    from hatchery.core.quantization import is_onebit_by_name
+    from hatchery.core.quantization import is_onebit_by_name, prepare_fp8_torchao_loader_kwargs
+
+    # FP8 is always an explicit caller request — no need to consult AutoConfig.
+    if quant_config is not None and quant_config.is_fp8_torchao:
+        return prepare_fp8_torchao_loader_kwargs(kwargs, fp8_mode=quant_config.fp8_mode)
 
     want_check = quant_config is not None and (quant_config.force or quant_config.is_onebit)
     if not want_check and not is_onebit_by_name(base_model_name):
