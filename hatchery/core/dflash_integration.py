@@ -739,12 +739,20 @@ def run_dflash_sample(
                 for row, sequence in zip(sequence_logprobs, sequences, strict=False)
             )
         ):
-            result["sequence_logprobs"] = _completion_logprobs(
-                verifier_model,
-                prompt_tokens=prompt_tokens,
-                sequences=sequences,
-                device=verifier_device,
-            )
+            try:
+                result["sequence_logprobs"] = _completion_logprobs(
+                    verifier_model,
+                    prompt_tokens=prompt_tokens,
+                    sequences=sequences,
+                    device=verifier_device,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "dflash.completion_logprobs_unavailable",
+                    extra={"error": str(exc)},
+                    exc_info=True,
+                )
+                result["sequence_logprobs"] = [[] for _ in sequences]
 
         logger.info(
             "dflash.sample_complete",
