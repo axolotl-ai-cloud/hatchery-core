@@ -36,7 +36,7 @@ class ScatterMoEKernelConfig:
     """ScatterMoE-LoRA kernel configuration."""
 
     enabled: bool = False
-    kernel_ref: str = "axolotl-ai-co/scattermoe-lora"
+    kernel_ref: str = "axolotl-ai-co/scattermoe"
     strict: bool = False
 
 
