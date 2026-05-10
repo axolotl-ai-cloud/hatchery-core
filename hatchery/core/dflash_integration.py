@@ -425,27 +425,36 @@ def _normalize_dflash_output(
             "sequence_logprobs": [],
         }
 
-    # ``output_ids`` includes the prompt; strip it.
-    completion = output_ids[0, prompt_len:].tolist()
+    completion_lengths = getattr(raw, "completion_lengths", None)
+    if completion_lengths is None:
+        completion_lengths = [max(int(output_ids.shape[1]) - int(prompt_len), 0)] * int(
+            output_ids.shape[0]
+        )
 
-    text = tokenizer.decode(completion, skip_special_tokens=True) if tokenizer else ""
+    eos = getattr(tokenizer, "eos_token_id", None) if tokenizer else None
+    sequences: list[list[int]] = []
+    texts: list[str] = []
+    stop_reasons: list[str] = []
+    for row_idx in range(int(output_ids.shape[0])):
+        length = int(completion_lengths[row_idx])
+        completion = output_ids[row_idx, prompt_len : prompt_len + length].tolist()
+        sequences.append(completion)
+        texts.append(tokenizer.decode(completion, skip_special_tokens=True) if tokenizer else "")
 
-    # Stop reason: hit a known stop id → "stop"; otherwise "length".
-    hit_stop = False
-    if stop_token_ids and completion:
-        last = completion[-1]
-        if last in stop_token_ids:
-            hit_stop = True
-    if not hit_stop:
-        eos = getattr(tokenizer, "eos_token_id", None) if tokenizer else None
-        if eos is not None and completion and completion[-1] == eos:
-            hit_stop = True
+        hit_stop = False
+        if completion:
+            last = int(completion[-1])
+            if stop_token_ids and last in stop_token_ids:
+                hit_stop = True
+            if eos is not None and last == eos:
+                hit_stop = True
+        stop_reasons.append("stop" if hit_stop else "length")
 
     out = {
-        "sequences": [completion],
-        "texts": [text],
-        "stop_reasons": ["stop" if hit_stop else "length"],
-        "sequence_logprobs": [[]],
+        "sequences": sequences,
+        "texts": texts,
+        "stop_reasons": stop_reasons,
+        "sequence_logprobs": [[] for _ in sequences],
     }
 
     if acceptance_lengths:
@@ -455,6 +464,12 @@ def _normalize_dflash_output(
         # number of accepted tokens for a single step (always ≥ 1 because
         # at least the verifier-emitted bonus token counts).
         out["acceptance_rate"] = float(sum(acceptance_lengths) / len(acceptance_lengths))
+    row_acceptance_lengths = getattr(raw, "row_acceptance_lengths", None)
+    if row_acceptance_lengths:
+        out["row_acceptance_lengths"] = row_acceptance_lengths
+    prompt_lengths = getattr(raw, "prompt_lengths", None)
+    if prompt_lengths:
+        out["prompt_lengths"] = prompt_lengths
 
     return out
 
@@ -624,20 +639,12 @@ def run_dflash_sample(
     # path runs.
     needs_real_draft = is_real_dflash
 
-    # The transformers backend is single-batch and temperature-only. We only
+    # The transformers backend is temperature-only. We only
     # surface those restrictions when the loaded dflash module is the real
     # one — test doubles exercising the mock ``generate`` attribute keep
-    # accepting top_p / top_k / n>1 verbatim so existing tests can still
+    # accepting top_p / top_k verbatim so existing tests can still
     # assert against the kwargs we forward.
     if needs_real_draft:
-        if n > 1:
-            meta.fallback_reason = "n_gt_1_unsupported"
-            if spec_request.strict:
-                raise ValueError(
-                    "DFlash transformers backend does not support n>1; "
-                    "strict mode rejected the request"
-                )
-            return None, meta
         constrained_top_p = top_p is not None and top_p < 1.0
         constrained_top_k = top_k is not None and top_k > 0
         if constrained_top_p or constrained_top_k:
@@ -699,6 +706,7 @@ def run_dflash_sample(
     )
     if needs_real_draft:
         canonical_kwargs["return_stats"] = True
+        canonical_kwargs["num_return_sequences"] = int(n)
     else:
         # Legacy / mocked surface: keep the keys the existing tests assert on.
         canonical_kwargs.update(

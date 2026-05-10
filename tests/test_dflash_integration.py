@@ -794,14 +794,70 @@ def test_resolve_stop_token_ids_int_passthrough_dedup():
     assert out == [5, 99]
 
 
-def test_real_dflash_n_gt_1_falls_back_with_metadata():
-    """Real-shaped dflash module + n>1 produces n_gt_1_unsupported fallback."""
+def test_normalize_dflash_output_handles_batched_completion_lengths():
+    tok = MagicMock()
+    tok.eos_token_id = 2
+    tok.decode.side_effect = lambda ids, **_: " ".join(str(x) for x in ids)
+    raw = SimpleNamespace(
+        output_ids=torch.tensor(
+            [
+                [1, 2, 10, 11, 2, 0],
+                [1, 2, 20, 21, 22, 23],
+            ]
+        ),
+        completion_lengths=[3, 4],
+        prompt_lengths=[2, 2],
+        acceptance_lengths=[1, 2],
+        row_acceptance_lengths=[[1, 2], [2, 2]],
+    )
+
+    out = _normalize_dflash_output(
+        raw,
+        tokenizer=tok,
+        prompt_len=2,
+        stop_token_ids=[2],
+    )
+
+    assert out["sequences"] == [[10, 11, 2], [20, 21, 22, 23]]
+    assert out["texts"] == ["10 11 2", "20 21 22 23"]
+    assert out["stop_reasons"] == ["stop", "length"]
+    assert out["row_acceptance_lengths"] == [[1, 2], [2, 2]]
+    assert out["prompt_lengths"] == [2, 2]
+
+
+def test_real_dflash_n_gt_1_passes_num_return_sequences():
+    """Real-shaped dflash module + n>1 uses DFlash num_return_sequences."""
+    captured_kwargs = {}
+
+    def fake_generate(**kwargs):
+        captured_kwargs.update(kwargs)
+        input_ids = kwargs["input_ids"]
+        rows = int(kwargs["num_return_sequences"])
+        prompt = input_ids.expand(rows, -1).contiguous()
+        extra = torch.full((rows, 5), 99, dtype=torch.long)
+        return SimpleNamespace(
+            output_ids=torch.cat([prompt, extra], dim=1),
+            completion_lengths=[5 for _ in range(rows)],
+            acceptance_lengths=[1, 2, 2],
+        )
+
     dflash_mod = _make_real_shaped_dflash_module()
     verifier = _FakePEFTWrappedVerifier()
     tok = MagicMock()
     tok.eos_token_id = 0
 
-    with patch.dict(sys.modules, {"dflash": dflash_mod}):
+    dflash_mod = _make_real_shaped_dflash_module(generate_fn=fake_generate)
+    with (
+        patch.dict(sys.modules, {"dflash": dflash_mod}),
+        patch(
+            "hatchery.core.dflash_integration._load_draft_model",
+            return_value=MagicMock(name="loaded_draft"),
+        ),
+        patch(
+            "hatchery.core.dflash_integration._completion_logprobs",
+            return_value=[[-0.1] * 5, [-0.2] * 5],
+        ),
+    ):
         result, meta = run_dflash_sample(
             verifier_model=verifier,
             tokenizer=tok,
@@ -810,7 +866,7 @@ def test_real_dflash_n_gt_1_falls_back_with_metadata():
             temperature=0.0,
             top_p=1.0,
             top_k=-1,
-            n=2,  # > 1 → fallback
+            n=2,
             seed=None,
             stop=None,
             spec_request=_make_spec_request(),
@@ -818,8 +874,12 @@ def test_real_dflash_n_gt_1_falls_back_with_metadata():
             device="cpu",
         )
 
-    assert result is None
-    assert meta.fallback_reason == "n_gt_1_unsupported"
+    assert result is not None
+    assert meta.fallback_reason is None
+    assert meta.used_backend == "dflash"
+    assert captured_kwargs["num_return_sequences"] == 2
+    assert len(result["sequences"]) == 2
+    assert result["sequences"] == [[99] * 5, [99] * 5]
 
 
 def test_real_dflash_top_p_falls_back_with_metadata():
