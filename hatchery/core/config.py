@@ -34,6 +34,13 @@ from hatchery.core.protocols import (
 )
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _default_lora_state_persister() -> LoraStatePersister:
     """Default LoRA state persister: bf16 snapshot on every save.
 
@@ -77,6 +84,12 @@ class Config:
     # eligible ``sample`` requests handled by ``GPUWorker._handle_sample``.
     # Import lazily to avoid pulling in dflash at core import time.
     dflash: Optional[object] = None
+
+    # Optional ScatterMoE-LoRA runtime optimization. ``None`` preserves the
+    # baseline runtime. When configured and enabled, core lazily loads the HF
+    # ``kernels`` package and applies the ScatterMoE kernel only for compatible
+    # models.
+    scattermoe_kernel: Optional[object] = None
 
     # LoRA state persister. Default is the bf16-snapshot-on-every-save
     # implementation in ``hatchery.core.lora_state``. Alternative persisters
@@ -130,14 +143,25 @@ class Config:
         base_model_name: str,
         lora_config: Any = None,
     ) -> dict[str, Any]:
-        """Best-effort hook for extension packages to patch model runtime behavior.
+        """Best-effort hook for optional runtime model optimizations.
 
-        Core leaves the model unchanged. Hosted installs can override this to
-        apply optional, lazy-loaded kernel paths such as ScatterMoE-LoRA.
+        Core ships the optional ScatterMoE-LoRA path. Hosted installs can
+        override or extend this for deployment-specific behavior.
         The return value is surfaced in worker registration metadata so
         operators can see which optional paths were selected.
         """
-        return {}
+        if self.scattermoe_kernel is None:
+            return {}
+
+        from hatchery.core.scattermoe_kernel import apply_scattermoe_kernel
+
+        report = apply_scattermoe_kernel(
+            model,
+            base_model_name=base_model_name,
+            lora_config=lora_config,
+            config=self.scattermoe_kernel,
+        )
+        return {"scattermoe_kernel": report.as_dict()}
 
 
 def build_core_config() -> Config:
@@ -235,6 +259,37 @@ def build_core_config() -> Config:
     # a VLLMSamplingBackend or similar via their config factory.
     sampling_backend = None
 
+    # Optional ScatterMoE kernel path. Prefer HATCHERY_* names in core while
+    # accepting the older SCATTERMOE_* names used by hosted deployments.
+    scattermoe_kernel = None
+    if any(
+        name in os.environ
+        for name in (
+            "HATCHERY_SCATTERMOE_KERNEL_ENABLED",
+            "HATCHERY_SCATTERMOE_KERNEL_REF",
+            "HATCHERY_SCATTERMOE_KERNEL_STRICT",
+            "SCATTERMOE_KERNEL_ENABLED",
+            "SCATTERMOE_KERNEL_REF",
+            "SCATTERMOE_KERNEL_STRICT",
+        )
+    ):
+        from hatchery.core.scattermoe_kernel import ScatterMoEKernelConfig
+
+        scattermoe_kernel = ScatterMoEKernelConfig(
+            enabled=_env_bool(
+                "HATCHERY_SCATTERMOE_KERNEL_ENABLED",
+                _env_bool("SCATTERMOE_KERNEL_ENABLED"),
+            ),
+            kernel_ref=os.environ.get(
+                "HATCHERY_SCATTERMOE_KERNEL_REF",
+                os.environ.get("SCATTERMOE_KERNEL_REF", "axolotl-ai-co/scattermoe-lora"),
+            ),
+            strict=_env_bool(
+                "HATCHERY_SCATTERMOE_KERNEL_STRICT",
+                _env_bool("SCATTERMOE_KERNEL_STRICT"),
+            ),
+        )
+
     return Config(
         auth=auth,
         metadata=metadata,
@@ -243,4 +298,5 @@ def build_core_config() -> Config:
         compute=compute,
         metrics=metrics,
         sampling_backend=sampling_backend,
+        scattermoe_kernel=scattermoe_kernel,
     )
