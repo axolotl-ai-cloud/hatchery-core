@@ -140,6 +140,18 @@ def test_policy_no_draft_model_returns_false_with_fallback_reason():
     assert meta.fallback_reason == "no_draft_model_configured"
 
 
+def test_policy_qwen36_base_model_infers_known_draft():
+    req = _make_spec_request()
+    cfg = DFlashConfig(draft_model=None)
+    should_use, meta = resolve_dflash_policy(
+        req,
+        cfg,
+        base_model_name="Qwen/Qwen3.6-35B-A3B",
+    )
+    assert should_use is True
+    assert meta.draft_model == "z-lab/Qwen3.6-35B-A3B-DFlash"
+
+
 def test_policy_strict_no_config_raises():
     req = SpeculativeDecodingRequest(enable=True, strict=True)
     with pytest.raises(ValueError, match="disabled"):
@@ -199,6 +211,7 @@ def _run_sample_no_dflash(**extra_kwargs: Any):
         spec_request=_make_spec_request(),
         dflash_config=_make_dflash_config(),
         device="cpu",
+        base_model_name="Qwen/Qwen3.6-35B-A3B",
         **extra_kwargs,
     )
 
@@ -229,6 +242,7 @@ def test_run_dflash_sample_not_installed_strict_raises(monkeypatch):
             spec_request=SpeculativeDecodingRequest(enable=True, strict=True),
             dflash_config=_make_dflash_config(),
             device="cpu",
+            base_model_name="Qwen/Qwen3.6-35B-A3B",
         )
 
 
@@ -281,6 +295,25 @@ def test_run_dflash_sample_success():
     assert meta.fallback_reason is None
 
 
+def test_run_dflash_sample_scores_missing_logprobs():
+    dflash_mod = _make_dflash_module(
+        generate_return={
+            "sequences": [[4, 5]],
+            "texts": ["4 5"],
+            "stop_reasons": ["length"],
+        }
+    )
+    verifier = _FakePEFTModel()
+
+    result, meta = _run_sample_with_mock_dflash(dflash_mod, verifier_model=verifier)
+
+    assert result is not None
+    assert result["sequences"] == [[4, 5]]
+    assert len(result["sequence_logprobs"]) == 1
+    assert len(result["sequence_logprobs"][0]) == 2
+    assert meta.used_backend == SPEC_BACKEND_DFLASH
+
+
 def test_run_dflash_sample_calls_generate_with_verifier(monkeypatch):
     """The PEFT-wrapped verifier is forwarded to dflash.generate() as-is."""
     verifier = MagicMock(name="peft_wrapped_model")
@@ -299,6 +332,17 @@ def test_run_dflash_sample_passes_draft_model():
     _run_sample_with_mock_dflash(dflash_mod, dflash_config=cfg)
     call_kwargs = dflash_mod.generate.call_args[1]
     assert call_kwargs["draft"] == "org/small-draft"
+
+
+def test_run_dflash_sample_infers_qwen36_draft_model():
+    dflash_mod = _make_dflash_module()
+    _run_sample_with_mock_dflash(
+        dflash_mod,
+        dflash_config=DFlashConfig(draft_model=None),
+        base_model_name="Qwen/Qwen3.6-35B-A3B",
+    )
+    call_kwargs = dflash_mod.generate.call_args[1]
+    assert call_kwargs["draft"] == "z-lab/Qwen3.6-35B-A3B-DFlash"
 
 
 def test_run_dflash_sample_passes_max_draft_tokens():
@@ -336,6 +380,27 @@ def test_run_dflash_sample_policy_mismatch_returns_none():
     req = SpeculativeDecodingRequest(enable=False)
     result, meta = _run_sample_with_mock_dflash(dflash_mod, spec_request=req)
     assert result is None
+    assert dflash_mod.generate.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_sample_explicit_disable_skips_qwen36_dflash():
+    """Explicit enable=False must not force the Qwen3.6 DFlash draft mapping."""
+    dflash_mod = _make_dflash_module()
+    cfg = _make_dflash_config(draft_model=None)
+    w = _make_minimal_worker_for_sample(dflash_cfg=cfg)
+
+    payload = {
+        "prompt_tokens": [1, 2],
+        "max_tokens": 8,
+        "temperature": 1.0,
+        "speculative_decoding": {"enable": False},
+    }
+    with patch.dict(sys.modules, {"dflash": dflash_mod}):
+        result, metrics = await w._handle_sample("sess-1", payload)
+
+    assert "spec_decoding_metadata" not in result
+    assert "spec_backend" not in metrics
     assert dflash_mod.generate.call_count == 0
 
 
@@ -729,14 +794,70 @@ def test_resolve_stop_token_ids_int_passthrough_dedup():
     assert out == [5, 99]
 
 
-def test_real_dflash_n_gt_1_falls_back_with_metadata():
-    """Real-shaped dflash module + n>1 produces n_gt_1_unsupported fallback."""
+def test_normalize_dflash_output_handles_batched_completion_lengths():
+    tok = MagicMock()
+    tok.eos_token_id = 2
+    tok.decode.side_effect = lambda ids, **_: " ".join(str(x) for x in ids)
+    raw = SimpleNamespace(
+        output_ids=torch.tensor(
+            [
+                [1, 2, 10, 11, 2, 0],
+                [1, 2, 20, 21, 22, 23],
+            ]
+        ),
+        completion_lengths=[3, 4],
+        prompt_lengths=[2, 2],
+        acceptance_lengths=[1, 2],
+        row_acceptance_lengths=[[1, 2], [2, 2]],
+    )
+
+    out = _normalize_dflash_output(
+        raw,
+        tokenizer=tok,
+        prompt_len=2,
+        stop_token_ids=[2],
+    )
+
+    assert out["sequences"] == [[10, 11, 2], [20, 21, 22, 23]]
+    assert out["texts"] == ["10 11 2", "20 21 22 23"]
+    assert out["stop_reasons"] == ["stop", "length"]
+    assert out["row_acceptance_lengths"] == [[1, 2], [2, 2]]
+    assert out["prompt_lengths"] == [2, 2]
+
+
+def test_real_dflash_n_gt_1_passes_num_return_sequences():
+    """Real-shaped dflash module + n>1 uses DFlash num_return_sequences."""
+    captured_kwargs = {}
+
+    def fake_generate(**kwargs):
+        captured_kwargs.update(kwargs)
+        input_ids = kwargs["input_ids"]
+        rows = int(kwargs["num_return_sequences"])
+        prompt = input_ids.expand(rows, -1).contiguous()
+        extra = torch.full((rows, 5), 99, dtype=torch.long)
+        return SimpleNamespace(
+            output_ids=torch.cat([prompt, extra], dim=1),
+            completion_lengths=[5 for _ in range(rows)],
+            acceptance_lengths=[1, 2, 2],
+        )
+
     dflash_mod = _make_real_shaped_dflash_module()
     verifier = _FakePEFTWrappedVerifier()
     tok = MagicMock()
     tok.eos_token_id = 0
 
-    with patch.dict(sys.modules, {"dflash": dflash_mod}):
+    dflash_mod = _make_real_shaped_dflash_module(generate_fn=fake_generate)
+    with (
+        patch.dict(sys.modules, {"dflash": dflash_mod}),
+        patch(
+            "hatchery.core.dflash_integration._load_draft_model",
+            return_value=MagicMock(name="loaded_draft"),
+        ),
+        patch(
+            "hatchery.core.dflash_integration._completion_logprobs",
+            return_value=[[-0.1] * 5, [-0.2] * 5],
+        ),
+    ):
         result, meta = run_dflash_sample(
             verifier_model=verifier,
             tokenizer=tok,
@@ -745,7 +866,7 @@ def test_real_dflash_n_gt_1_falls_back_with_metadata():
             temperature=0.0,
             top_p=1.0,
             top_k=-1,
-            n=2,  # > 1 → fallback
+            n=2,
             seed=None,
             stop=None,
             spec_request=_make_spec_request(),
@@ -753,8 +874,12 @@ def test_real_dflash_n_gt_1_falls_back_with_metadata():
             device="cpu",
         )
 
-    assert result is None
-    assert meta.fallback_reason == "n_gt_1_unsupported"
+    assert result is not None
+    assert meta.fallback_reason is None
+    assert meta.used_backend == "dflash"
+    assert captured_kwargs["num_return_sequences"] == 2
+    assert len(result["sequences"]) == 2
+    assert result["sequences"] == [[99] * 5, [99] * 5]
 
 
 def test_real_dflash_top_p_falls_back_with_metadata():

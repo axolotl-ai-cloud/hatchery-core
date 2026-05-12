@@ -40,6 +40,13 @@ def test_qwen35_default_context():
     assert r.required_cp_degree == 1  # 64K fits on single GPU
 
 
+def test_qwen36_default_context():
+    """Qwen 3.6 family defaults to 262K."""
+    r = resolve_model_id("Qwen/Qwen3.6-35B-A3B")
+    assert r.max_context_length == 262144
+    assert r.required_cp_degree == 4
+
+
 def test_unknown_model_defaults_to_32k():
     r = resolve_model_id("some-org/unknown-model-7B")
     assert r.max_context_length == 32768

@@ -2,59 +2,55 @@
 # Copyright (c) Axolotl AI
 # Licensed under the Apache License, Version 2.0
 
-"""1-bit / 1.58-bit LLM detection and loader wiring.
+"""Base-model quantization detection and loader wiring.
 
-Ternary-weight ("onebit") language models like the BitNet b1.58 family
-store *master weights* in BF16 on disk and apply weight / activation
-quantization inside the forward pass (straight-through estimator style),
-so regular :class:`AutoModelForCausalLM.from_pretrained` can load them
-today. What the training stack still needs is:
-
-1. A way to *detect* that a base model belongs to a 1-bit family
-   before we commit to dtype, attention backend, or LoRA plan.
-2. A config surface where callers can opt in (or force in) a 1-bit
-   loader path — useful when we one day want to bolt an explicit
-   quantized-inference kernel on top of the same checkpoint.
-3. A routing hook inside the model pool / trainer so the above stay
-   out of the hot path for ordinary full-precision models.
-
-Trainability note
+Supported schemes
 -----------------
-BitNet-family models are trained with quantization-aware training:
-the published BF16 checkpoints are the *master weights* that flow
-through a straight-through estimator at forward time. The faithful
-fine-tuning path is full-parameter (FFT) on those master weights —
-that's how the original training ran, and it's what the BitNet
-authors recommend.
+* ``"none"`` — ordinary BF16/FP16 load (default).
+* ``"onebit"`` — 1.58-bit ternary BitNet master-weight load.
+* ``"fp8_torchao"`` — FP8 weight quantization via TorchAO; autograd-
+  compatible for training and PEFT LoRA.
 
-LoRA on top of a BitNet base is *possible* (base linears stay
-frozen, LoRA deltas train normally) but the low-rank updates sit
-*before* the forward-time quantizer, so the dynamics are muddled —
-gradients from the STE-quantized forward flow into the low-rank
-A/B matrices and the training signal is weaker than on a vanilla
-base. Some community fine-tunes do work this way, but it's an
-informed trade-off, not the default.
+1-bit / BitNet (``"onebit"``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Ternary-weight models like BitNet b1.58 store *master weights* in BF16
+on disk and apply weight/activation quantization inside the forward pass
+(straight-through estimator style).  The faithful fine-tuning path is
+full-parameter (FFT) on those master weights.  LoRA is possible but the
+deltas sit before the STE quantizer, weakening the training signal.  We
+therefore default to ``require_full_param=True`` for ``"onebit"``.
 
-We therefore default to ``require_full_param=True`` for the
-``"onebit"`` scheme: a LoRA session attaching to a detected
-BitNet base is refused, and callers who know they want LoRA must
-flip the flag explicitly.
+Detection: ``config.model_type == "bitnet"``, ``architectures`` starting
+with ``"BitNet"``, ``quantization_config.quant_method == "bitnet"``, or
+a model-name slug hint.
 
-Detection strategy
-------------------
-We look at the HF ``AutoConfig`` for the model:
+FP8 via TorchAO (``"fp8_torchao"``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+TorchAO float8 kernels are autograd-compatible — gradients flow through
+FP8 linear layers during forward *and* backward.  This is the correct
+path for FP8 training; do **not** use the Transformers
+``finegrained_fp8`` / ``FP8Linear`` kernels, which are inference-only.
 
-* ``config.model_type == "bitnet"`` — the canonical signal used by
-  ``transformers>=4.51``.
-* ``architectures`` containing a class name starting with ``BitNet``
-  (defensive: some checkpoints set this, some don't).
-* ``quantization_config.quant_method == "bitnet"`` — for hypothetical
-  post-training-quantized checkpoints.
-* ``config._name_or_path`` containing a known BitNet slug, as a last
-  resort for lovingly-hand-edited configs.
+PEFT LoRA is fully supported on TorchAO-quantized models (``require_full_param``
+does **not** apply to ``"fp8_torchao"``).
 
-All checks are best-effort and pure; they don't touch CUDA or download
-weights.
+Two sub-modes controlled by :attr:`QuantConfig.fp8_mode`:
+
+* ``"weight_only"`` (default) — stores weights in FP8; activations stay
+  in BF16.  Works on all FP8-capable hardware (Ada Lovelace, Hopper,
+  Blackwell).  Requires ``torchao >= 0.4`` and ``transformers >= 4.46``.
+* ``"dynamic"`` — quantizes weights **and** activations dynamically per
+  token.  Faster on large batches but requires CUDA compute capability
+  >= 9.0 (NVIDIA H100 / H200 / Blackwell).
+
+Detection from an existing FP8 TorchAO checkpoint: ``quantization_config``
+dict/object with ``quant_type == "torchao"`` and a ``torchao_config``
+string that contains ``"float8"`` or ``"Float8"``.
+
+BF16 fallback
+~~~~~~~~~~~~~
+BF16 is **not** the default FP8 fallback.  Set
+``HATCHERY_QUANT_SCHEME=none`` explicitly if you want a plain BF16 load.
 """
 
 from __future__ import annotations
@@ -66,8 +62,10 @@ __all__ = [
     "QuantConfig",
     "QuantScheme",
     "detect_quant_scheme",
+    "is_fp8_torchao_model",
     "is_onebit_by_name",
     "is_onebit_model",
+    "prepare_fp8_torchao_loader_kwargs",
     "prepare_onebit_loader_kwargs",
     "resolve_quant_scheme",
 ]
@@ -75,15 +73,22 @@ __all__ = [
 
 # Known scheme tags. Kept as strings rather than an Enum so the
 # dataclass stays trivially serializable alongside other configs.
-QuantScheme = str  # "none" | "onebit" (1.58-bit ternary master-weight)
+QuantScheme = str  # "none" | "onebit" | "fp8_torchao"
 SCHEME_NONE: QuantScheme = "none"
 SCHEME_ONEBIT: QuantScheme = "onebit"
+SCHEME_FP8_TORCHAO: QuantScheme = "fp8_torchao"
+
+_VALID_SCHEMES = (SCHEME_NONE, SCHEME_ONEBIT, SCHEME_FP8_TORCHAO)
 
 _BITNET_ARCH_PREFIXES = ("BitNet",)
 _BITNET_MODEL_TYPES = ("bitnet",)
 # Slug substrings used as a last-resort heuristic when config is
 # missing or mis-filled. Lowercase-compared.
 _BITNET_NAME_HINTS = ("bitnet-b1.58", "bitnet_b1_58", "1bitllm/bitnet")
+
+# Substrings that identify a TorchAO FP8 config within the serialised
+# torchao_config field (either the class repr or the short string alias).
+_TORCHAO_FP8_HINTS = ("float8", "Float8")
 
 
 @dataclass
@@ -93,36 +98,47 @@ class QuantConfig:
     Attributes
     ----------
     scheme:
-        One of ``"none"`` (default — ordinary BF16/FP16 load) or
-        ``"onebit"`` (1.58-bit BitNet master-weight load).
+        One of ``"none"`` (default — ordinary BF16/FP16 load),
+        ``"onebit"`` (1.58-bit BitNet master-weight load), or
+        ``"fp8_torchao"`` (FP8 via TorchAO — training-compatible).
     force:
         If ``True``, callers assert the model is ``scheme`` regardless
-        of auto-detection. Used for tests, or to override a
-        misconfigured checkpoint. If ``False`` (default), the loader
-        auto-detects and may upgrade ``"none"`` → ``"onebit"`` when
-        the checkpoint is recognised as BitNet.
+        of auto-detection. If ``False`` (default), the loader
+        auto-detects and may upgrade when the checkpoint is recognised.
     require_full_param:
-        If ``True`` and ``scheme == "onebit"``, LoRA attach is refused
-        — BitNet's training recipe is full-parameter on the BF16
-        master weights (see the module docstring). Defaults to
-        ``True``; set to ``False`` explicitly if you've decided to
-        train a LoRA adapter on top of a BitNet base despite the
-        caveats.
+        If ``True`` and ``scheme == "onebit"``, LoRA attach is refused.
+        Irrelevant for ``"fp8_torchao"`` — TorchAO FP8 fully supports
+        PEFT LoRA via autograd-compatible forward/backward.
+    fp8_mode:
+        Sub-mode for ``scheme == "fp8_torchao"``.  ``"weight_only"``
+        (default) stores weights in FP8, activations in BF16.
+        ``"dynamic"`` quantizes both weights and activations per-token;
+        requires CUDA compute capability >= 9.0 (H100/H200/Blackwell).
+        Ignored for other schemes.
     """
 
     scheme: QuantScheme = SCHEME_NONE
     force: bool = False
     require_full_param: bool = True
+    fp8_mode: str = "weight_only"
 
     def __post_init__(self) -> None:
-        if self.scheme not in (SCHEME_NONE, SCHEME_ONEBIT):
+        if self.scheme not in _VALID_SCHEMES:
             raise ValueError(
-                f"QuantConfig.scheme must be one of 'none' / 'onebit', got {self.scheme!r}"
+                f"QuantConfig.scheme must be one of {_VALID_SCHEMES!r}, got {self.scheme!r}"
+            )
+        if self.fp8_mode not in ("weight_only", "dynamic"):
+            raise ValueError(
+                f"QuantConfig.fp8_mode must be 'weight_only' or 'dynamic', got {self.fp8_mode!r}"
             )
 
     @property
     def is_onebit(self) -> bool:
         return self.scheme == SCHEME_ONEBIT
+
+    @property
+    def is_fp8_torchao(self) -> bool:
+        return self.scheme == SCHEME_FP8_TORCHAO
 
 
 def _architectures_look_bitnet(architectures: Any) -> bool:
@@ -193,12 +209,51 @@ def is_onebit_model(hf_config: Any, *, model_name: Optional[str] = None) -> bool
     return _name_hint_is_bitnet(getattr(hf_config, "_name_or_path", None))
 
 
+def _quantization_config_is_fp8_torchao(quantization_config: Any) -> bool:
+    """Return True if quantization_config describes a TorchAO FP8 setup.
+
+    Accepts both the dict form (serialised config.json) and a live
+    HF ``QuantizationConfigMixin`` object.
+    """
+    if quantization_config is None:
+        return False
+    if isinstance(quantization_config, dict):
+        quant_type = quantization_config.get("quant_type", "")
+        torchao_str = str(quantization_config.get("torchao_config", ""))
+    else:
+        quant_type = getattr(quantization_config, "quant_type", "")
+        torchao_str = str(getattr(quantization_config, "torchao_config", ""))
+    if not isinstance(quant_type, str) or quant_type.lower() != "torchao":
+        return False
+    return any(hint in torchao_str for hint in _TORCHAO_FP8_HINTS)
+
+
+def is_fp8_torchao_model(hf_config: Any) -> bool:
+    """Return ``True`` if the HF config describes a TorchAO FP8 model.
+
+    Detects checkpoints that were already saved with a TorchAO FP8
+    ``quantization_config``.  When the caller is *applying* FP8 at
+    load time via :func:`prepare_fp8_torchao_loader_kwargs`, this will
+    be ``False`` on the raw checkpoint config (pre-load) and ``True``
+    on the loaded model config (post-quantization).
+    """
+    return _quantization_config_is_fp8_torchao(getattr(hf_config, "quantization_config", None))
+
+
 def detect_quant_scheme(hf_config: Any, *, model_name: Optional[str] = None) -> QuantScheme:
     """Classify a model into one of the known schemes.
 
     Pure — no torch, no network, no filesystem work beyond whatever
     the caller already did to obtain ``hf_config``.
+
+    Ordering: FP8 TorchAO is checked before 1-bit because an explicit
+    ``quantization_config.quant_type == "torchao"`` in the checkpoint is
+    a more specific signal than the ``model_type``/slug heuristics used
+    for BitNet detection.  A BitNet model saved with a TorchAO FP8
+    ``quantization_config`` is classified as ``"fp8_torchao"``.
     """
+    if is_fp8_torchao_model(hf_config):
+        return SCHEME_FP8_TORCHAO
     if is_onebit_model(hf_config, model_name=model_name):
         return SCHEME_ONEBIT
     return SCHEME_NONE
@@ -217,20 +272,104 @@ def resolve_quant_scheme(
     * ``requested.force`` short-circuits the whole resolver and returns
       ``requested.scheme`` verbatim — the caller is telling us they
       know better.
-    * Otherwise, autodetect; if the caller asked for a specific scheme
-      and autodetection agrees (or the caller asked for ``"none"`` and
-      autodetect returns ``"onebit"``), the autodetect result wins —
-      we'd rather silently upgrade than mis-load.
+    * Otherwise, autodetect; if the checkpoint already has a recognised
+      quantization scheme in its config, autodetection wins — we'd
+      rather silently upgrade than mis-load.
     """
     if requested is not None and requested.force:
         return requested.scheme
     auto = detect_quant_scheme(hf_config, model_name=model_name)
     if requested is None:
         return auto
-    # Silent upgrade when we find a 1-bit model the caller didn't flag.
-    if auto == SCHEME_ONEBIT:
-        return SCHEME_ONEBIT
+    # Silent upgrade when we detect a known scheme the caller didn't flag.
+    if auto in (SCHEME_ONEBIT, SCHEME_FP8_TORCHAO):
+        return auto
     return requested.scheme
+
+
+def prepare_fp8_torchao_loader_kwargs(
+    base_kwargs: dict[str, Any],
+    *,
+    fp8_mode: str = "weight_only",
+) -> dict[str, Any]:
+    """Inject a TorchAO FP8 quantization config into ``from_pretrained`` kwargs.
+
+    This is the training-compatible FP8 path.  It sets
+    ``quantization_config`` to a :class:`transformers.TorchAoConfig`
+    wrapping either :class:`~torchao.quantization.Float8WeightOnlyConfig`
+    or :class:`~torchao.quantization.Float8DynamicActivationFloat8WeightConfig`.
+
+    **Do NOT use** the Transformers ``finegrained_fp8`` / ``FP8Linear``
+    path for training — those kernels are inference-only and lack
+    autograd support.
+
+    Hardware / dependency caveats
+    ------------------------------
+    * Requires ``torchao >= 0.4`` and ``transformers >= 4.46``.
+    * ``fp8_mode="weight_only"`` — stores weights in FP8; activations
+      remain in BF16.  Compatible with all FP8-capable hardware
+      (NVIDIA Ada Lovelace L40, Hopper H100/H200, Blackwell).
+    * ``fp8_mode="dynamic"`` — dynamically quantizes weights *and*
+      activations to FP8 per-token.  Faster on large batches but
+      requires CUDA compute capability >= 9.0 (H100 / H200 / Blackwell
+      only).  Will raise ``RuntimeError`` on older hardware at runtime.
+
+    LoRA note
+    ---------
+    TorchAO FP8 models support PEFT LoRA — gradients flow through FP8
+    linear layers via the autograd-compatible torchao float8 kernels.
+    The ``require_full_param`` guard in the trainer does **not** apply
+    to ``"fp8_torchao"`` sessions.
+
+    BF16 fallback
+    -------------
+    BF16 is **not** the default fallback.  If you want a plain BF16
+    load, set ``HATCHERY_QUANT_SCHEME=none`` explicitly.
+
+    Parameters
+    ----------
+    base_kwargs:
+        Starting keyword-argument dict for ``AutoModelForCausalLM.from_pretrained``.
+        Returned dict is a copy with ``quantization_config`` added.
+    fp8_mode:
+        ``"weight_only"`` or ``"dynamic"`` (see above).
+    """
+    try:
+        from transformers import TorchAoConfig
+    except ImportError:
+        raise RuntimeError(
+            "transformers.TorchAoConfig not found. "
+            "Upgrade to transformers >= 4.46 to enable TorchAO quantization."
+        ) from None
+
+    if fp8_mode == "dynamic":
+        try:
+            from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
+
+            torchao_cfg: Any = Float8DynamicActivationFloat8WeightConfig()
+        except ImportError:
+            raise RuntimeError(
+                "torchao.quantization.Float8DynamicActivationFloat8WeightConfig not found. "
+                "Install torchao >= 0.4. "
+                "fp8_mode='dynamic' also requires CUDA compute capability >= 9.0 "
+                "(NVIDIA H100 / H200 / Blackwell)."
+            ) from None
+    else:
+        try:
+            from torchao.quantization import Float8WeightOnlyConfig
+
+            torchao_cfg = Float8WeightOnlyConfig()
+        except ImportError:
+            raise RuntimeError(
+                "torchao.quantization.Float8WeightOnlyConfig not found. "
+                "Install torchao >= 0.4 for FP8 weight-only quantization. "
+                "Runtime also requires FP8-capable hardware (NVIDIA Ada Lovelace "
+                "L40, Hopper H100/H200, or Blackwell)."
+            ) from None
+
+    kwargs = dict(base_kwargs)
+    kwargs["quantization_config"] = TorchAoConfig(torchao_cfg)
+    return kwargs
 
 
 def prepare_onebit_loader_kwargs(

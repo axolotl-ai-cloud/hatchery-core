@@ -83,14 +83,30 @@ class ParallelConfig:
 
     @classmethod
     def from_env(cls) -> ParallelConfig:
-        """Build a config from environment variables set by torchrun."""
+        """Build a config from environment variables set by torchrun.
+
+        Quantization env vars
+        ---------------------
+        ``HATCHERY_QUANT_SCHEME`` — ``"none"`` (default), ``"onebit"``,
+        or ``"fp8_torchao"``.  Unknown values degrade silently to
+        ``"none"`` so a typo doesn't prevent the worker from booting.
+
+        ``HATCHERY_FP8_MODE`` — ``"weight_only"`` (default) or
+        ``"dynamic"``.  Only meaningful when
+        ``HATCHERY_QUANT_SCHEME=fp8_torchao``.  ``"dynamic"`` requires
+        CUDA compute capability >= 9.0 (H100 / H200 / Blackwell).
+        Unknown values degrade to ``"weight_only"``.
+        """
         raw_max_packed = os.environ.get("HATCHERY_MAX_PACKED_LEN")
         max_packed_len = int(raw_max_packed) if raw_max_packed else None
+        _valid_schemes = ("none", "onebit", "fp8_torchao")
         quant_scheme = os.environ.get("HATCHERY_QUANT_SCHEME", "none").lower()
+        raw_fp8_mode = os.environ.get("HATCHERY_FP8_MODE", "weight_only").lower()
         quant = QuantConfig(
-            scheme=quant_scheme if quant_scheme in ("none", "onebit") else "none",
+            scheme=quant_scheme if quant_scheme in _valid_schemes else "none",
             force=os.environ.get("HATCHERY_QUANT_FORCE", "0") == "1",
             require_full_param=os.environ.get("HATCHERY_QUANT_REQUIRE_FULL_PARAM", "1") == "1",
+            fp8_mode=raw_fp8_mode if raw_fp8_mode in ("weight_only", "dynamic") else "weight_only",
         )
         return cls(
             dp_degree=int(os.environ.get("HATCHERY_DP_DEGREE", "1")),

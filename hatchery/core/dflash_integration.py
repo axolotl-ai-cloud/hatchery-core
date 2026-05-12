@@ -38,6 +38,11 @@ counterparts). DFlash's transformers backend reaches into ``target.model`` and
 ``target.lm_head``, so we forward the LoRA-augmented inner causal LM rather
 than the outer PEFT wrapper. Verifier outputs still reflect the trained
 adapters because the in-place LoRA modules participate in every forward pass.
+
+Model-aware draft selection: if the worker config does not name an explicit
+draft model, the policy can infer a known draft from the verifier base model
+name. That keeps the Qwen3.6 DFlash path ergonomic while preserving the
+existing disable/strict behavior.
 """
 
 from __future__ import annotations
@@ -61,6 +66,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("hatchery.core.dflash_integration")
 
+_DEFAULT_DFLASH_DRAFT_MODELS: dict[str, str] = {
+    "Qwen/Qwen3.6-35B-A3B": "z-lab/Qwen3.6-35B-A3B-DFlash",
+}
+
 
 @dataclass
 class DFlashConfig:
@@ -75,10 +84,8 @@ class DFlashConfig:
     Attributes
     ----------
     draft_model:
-        HF model name or local path for the draft model. *Required* — without
-        it, DFlash is skipped regardless of per-request opts. The draft is
-        loaded with ``trust_remote_code=True`` because z-lab's draft repos
-        ship custom modeling code.
+        HF model name or local path for the draft model. When omitted, the
+        policy can infer a known draft for supported verifier base models.
     max_draft_tokens:
         Default maximum draft tokens per speculation step (per-request
         ``max_draft_tokens`` overrides this). Forwarded to dflash as the
@@ -140,6 +147,15 @@ def _resolve_dflash_generate(dflash_mod: Any) -> tuple[Any, bool]:
     return fn, is_real
 
 
+def _resolve_default_draft_model(base_model_name: Optional[str]) -> Optional[str]:
+    if base_model_name is None:
+        return None
+    for prefix, draft_model in _DEFAULT_DFLASH_DRAFT_MODELS.items():
+        if base_model_name == prefix or base_model_name.startswith(prefix):
+            return draft_model
+    return None
+
+
 def parse_spec_request(payload: dict) -> Optional[SpeculativeDecodingRequest]:
     """Extract and validate the ``speculative_decoding`` entry from a sample payload.
 
@@ -157,6 +173,8 @@ def parse_spec_request(payload: dict) -> Optional[SpeculativeDecodingRequest]:
 def resolve_dflash_policy(
     spec_request: Optional[SpeculativeDecodingRequest],
     dflash_config: Optional[DFlashConfig],
+    *,
+    base_model_name: Optional[str] = None,
 ) -> tuple[bool, SpeculativeDecodingMetadata]:
     """Decide whether a sample request should use DFlash speculative decoding.
 
@@ -199,7 +217,8 @@ def resolve_dflash_policy(
             raise ValueError("DFlash is disabled on this worker but strict mode was requested")
         return False, meta
 
-    if not dflash_config.draft_model:
+    draft_model = dflash_config.draft_model or _resolve_default_draft_model(base_model_name)
+    if not draft_model:
         meta.fallback_reason = "no_draft_model_configured"
         if spec_request.strict:
             raise ValueError(
@@ -212,7 +231,7 @@ def resolve_dflash_policy(
         if spec_request.max_draft_tokens is not None
         else dflash_config.max_draft_tokens
     )
-    meta.draft_model = dflash_config.draft_model
+    meta.draft_model = draft_model
     meta.max_draft_tokens = max_draft
 
     return True, meta
@@ -406,27 +425,36 @@ def _normalize_dflash_output(
             "sequence_logprobs": [],
         }
 
-    # ``output_ids`` includes the prompt; strip it.
-    completion = output_ids[0, prompt_len:].tolist()
+    completion_lengths = getattr(raw, "completion_lengths", None)
+    if completion_lengths is None:
+        completion_lengths = [max(int(output_ids.shape[1]) - int(prompt_len), 0)] * int(
+            output_ids.shape[0]
+        )
 
-    text = tokenizer.decode(completion, skip_special_tokens=True) if tokenizer else ""
+    eos = getattr(tokenizer, "eos_token_id", None) if tokenizer else None
+    sequences: list[list[int]] = []
+    texts: list[str] = []
+    stop_reasons: list[str] = []
+    for row_idx in range(int(output_ids.shape[0])):
+        length = int(completion_lengths[row_idx])
+        completion = output_ids[row_idx, prompt_len : prompt_len + length].tolist()
+        sequences.append(completion)
+        texts.append(tokenizer.decode(completion, skip_special_tokens=True) if tokenizer else "")
 
-    # Stop reason: hit a known stop id → "stop"; otherwise "length".
-    hit_stop = False
-    if stop_token_ids and completion:
-        last = completion[-1]
-        if last in stop_token_ids:
-            hit_stop = True
-    if not hit_stop:
-        eos = getattr(tokenizer, "eos_token_id", None) if tokenizer else None
-        if eos is not None and completion and completion[-1] == eos:
-            hit_stop = True
+        hit_stop = False
+        if completion:
+            last = int(completion[-1])
+            if stop_token_ids and last in stop_token_ids:
+                hit_stop = True
+            if eos is not None and last == eos:
+                hit_stop = True
+        stop_reasons.append("stop" if hit_stop else "length")
 
     out = {
-        "sequences": [completion],
-        "texts": [text],
-        "stop_reasons": ["stop" if hit_stop else "length"],
-        "sequence_logprobs": [[]],
+        "sequences": sequences,
+        "texts": texts,
+        "stop_reasons": stop_reasons,
+        "sequence_logprobs": [[] for _ in sequences],
     }
 
     if acceptance_lengths:
@@ -436,7 +464,63 @@ def _normalize_dflash_output(
         # number of accepted tokens for a single step (always ≥ 1 because
         # at least the verifier-emitted bonus token counts).
         out["acceptance_rate"] = float(sum(acceptance_lengths) / len(acceptance_lengths))
+    row_acceptance_lengths = getattr(raw, "row_acceptance_lengths", None)
+    if row_acceptance_lengths:
+        out["row_acceptance_lengths"] = row_acceptance_lengths
+    prompt_lengths = getattr(raw, "prompt_lengths", None)
+    if prompt_lengths:
+        out["prompt_lengths"] = prompt_lengths
 
+    return out
+
+
+def _completion_logprobs(
+    verifier_model: Any,
+    *,
+    prompt_tokens: list[int],
+    sequences: list[list[int]],
+    device: Any,
+) -> list[list[float]]:
+    """Score DFlash completions with the verifier model.
+
+    Tinker's sample response carries one rollout-policy logprob per generated
+    token. DFlash currently returns token IDs and acceptance stats, so we run a
+    no-grad verifier pass over prompt+completion to recover the same
+    completion logprobs the standard HF generate path exposes.
+    """
+    if not sequences:
+        return []
+
+    model_config = getattr(verifier_model, "config", None)
+    pad_id = int(
+        getattr(model_config, "pad_token_id", None) or getattr(model_config, "eos_token_id", 0) or 0
+    )
+    max_len = max(len(prompt_tokens) + len(sequence) for sequence in sequences)
+    rows: list[list[int]] = []
+    for sequence in sequences:
+        row = [int(token) for token in prompt_tokens] + [int(token) for token in sequence]
+        rows.append(row + [pad_id] * (max_len - len(row)))
+
+    input_ids = torch.tensor(rows, device=device, dtype=torch.long)
+    attention_mask = torch.zeros_like(input_ids)
+    for row_idx, sequence in enumerate(sequences):
+        attention_mask[row_idx, : len(prompt_tokens) + len(sequence)] = 1
+
+    with torch.no_grad():
+        outputs = verifier_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        log_probs = torch.nn.functional.log_softmax(outputs.logits.float(), dim=-1)
+
+    out: list[list[float]] = []
+    start = max(len(prompt_tokens) - 1, 0)
+    for row_idx, sequence in enumerate(sequences):
+        row: list[float] = []
+        for offset, token in enumerate(sequence):
+            row.append(float(log_probs[row_idx, start + offset, int(token)].detach().cpu()))
+        out.append(row)
     return out
 
 
@@ -455,6 +539,7 @@ def run_dflash_sample(
     spec_request: SpeculativeDecodingRequest,
     dflash_config: DFlashConfig,
     device: Any,
+    base_model_name: Optional[str] = None,
 ) -> tuple[Optional[dict], SpeculativeDecodingMetadata]:
     """Attempt DFlash speculative decoding; return normalized result or fallback signal.
 
@@ -503,7 +588,11 @@ def run_dflash_sample(
     ValueError from :func:`resolve_dflash_policy` (or the n>1 / top_p / top_k
     surface fallbacks below) when strict mode is True.
     """
-    should_use, meta = resolve_dflash_policy(spec_request, dflash_config)
+    should_use, meta = resolve_dflash_policy(
+        spec_request,
+        dflash_config,
+        base_model_name=base_model_name,
+    )
     if not should_use:
         return None, meta
 
@@ -548,20 +637,12 @@ def run_dflash_sample(
     # path runs.
     needs_real_draft = is_real_dflash
 
-    # The transformers backend is single-batch and temperature-only. We only
+    # The transformers backend is temperature-only. We only
     # surface those restrictions when the loaded dflash module is the real
     # one — test doubles exercising the mock ``generate`` attribute keep
-    # accepting top_p / top_k / n>1 verbatim so existing tests can still
+    # accepting top_p / top_k verbatim so existing tests can still
     # assert against the kwargs we forward.
     if needs_real_draft:
-        if n > 1:
-            meta.fallback_reason = "n_gt_1_unsupported"
-            if spec_request.strict:
-                raise ValueError(
-                    "DFlash transformers backend does not support n>1; "
-                    "strict mode rejected the request"
-                )
-            return None, meta
         constrained_top_p = top_p is not None and top_p < 1.0
         constrained_top_k = top_k is not None and top_k > 0
         if constrained_top_p or constrained_top_k:
@@ -623,6 +704,7 @@ def run_dflash_sample(
     )
     if needs_real_draft:
         canonical_kwargs["return_stats"] = True
+        canonical_kwargs["num_return_sequences"] = int(n)
     else:
         # Legacy / mocked surface: keep the keys the existing tests assert on.
         canonical_kwargs.update(
@@ -650,6 +732,32 @@ def run_dflash_sample(
         result = _normalize_dflash_output(
             raw_output, prompt_len=prompt_len, tokenizer=tokenizer, stop_token_ids=stop_token_ids
         )
+        sequences = [
+            [int(token) for token in sequence] for sequence in result.get("sequences") or []
+        ]
+        sequence_logprobs = result.get("sequence_logprobs")
+        if (
+            not sequence_logprobs
+            or len(sequence_logprobs) != len(sequences)
+            or any(
+                len(row) != len(sequence)
+                for row, sequence in zip(sequence_logprobs, sequences, strict=False)
+            )
+        ):
+            try:
+                result["sequence_logprobs"] = _completion_logprobs(
+                    verifier_model,
+                    prompt_tokens=prompt_tokens,
+                    sequences=sequences,
+                    device=verifier_device,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "dflash.completion_logprobs_unavailable",
+                    extra={"error": str(exc)},
+                    exc_info=True,
+                )
+                result["sequence_logprobs"] = [[] for _ in sequences]
 
         logger.info(
             "dflash.sample_complete",

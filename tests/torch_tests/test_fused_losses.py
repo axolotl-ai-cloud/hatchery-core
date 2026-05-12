@@ -19,6 +19,7 @@ torch = pytest.importorskip("torch")
 
 from hatchery.core.fused_losses import (  # noqa: E402
     _chunked_cross_entropy,
+    _liger_loss_tensor,
     _lm_head_is_clean,
     is_fused_eligible,
     is_fused_grpo_eligible,
@@ -79,6 +80,15 @@ def test_chunked_ce_gradient_matches_reference():
     ref.backward()
 
     assert torch.allclose(flat_hidden_a.grad, flat_hidden_b.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_liger_loss_tensor_accepts_scalar_and_tuple_outputs():
+    loss = torch.tensor(1.25, requires_grad=True)
+    z_loss = torch.tensor(0.5)
+    token_accuracy = torch.tensor(0.75)
+
+    assert _liger_loss_tensor(loss) is loss
+    assert _liger_loss_tensor((loss, z_loss, token_accuracy)) is loss
 
 
 def test_is_fused_eligible_rejects_2d_labels():

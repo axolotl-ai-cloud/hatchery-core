@@ -137,6 +137,7 @@ class WorkerInfo:
     spot: bool = False
     last_heartbeat: Optional[float] = None
     cp_degree: int = 1  # context parallelism degree this worker supports
+    runtime_optimizations: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

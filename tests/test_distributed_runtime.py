@@ -10,8 +10,6 @@ import types
 
 import pytest
 
-pytestmark = [pytest.mark.fsdp2]
-
 from hatchery.core.distributed import (
     CORE_DP_EXTENSION_NAME,
     DistributedRuntime,
@@ -26,6 +24,8 @@ from hatchery.core.parallel_hooks import (
     _reset_parallel_hooks_for_tests,
     register_parallel_extension,
 )
+
+pytestmark = [pytest.mark.fsdp2]
 
 
 @pytest.fixture(autouse=True)

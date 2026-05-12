@@ -43,6 +43,7 @@ class ResolvedModel:
 # These match the TM docs. Models not in this table get 32K.
 _DEFAULT_CONTEXT: dict[str, int] = {
     "Qwen/Qwen3.5": 65536,
+    "Qwen/Qwen3.6": 262144,
     "nvidia/NVIDIA-Nemotron-3": 65536,
 }
 
