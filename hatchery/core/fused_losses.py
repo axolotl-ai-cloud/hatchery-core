@@ -265,6 +265,20 @@ def _try_import_liger() -> Any:
         return None
 
 
+def _liger_loss_tensor(output: Any) -> Any:
+    """Normalize Liger fused CE output across liger-kernel versions.
+
+    Older Liger releases returned the scalar loss directly. Newer
+    releases return ``(loss, z_loss, token_accuracy)`` so callers can
+    opt into diagnostics without a second kernel. Hatchery's fused SFT
+    path needs only the scalar loss; selecting element 0 preserves the
+    autograd edge back through the custom Function.
+    """
+    if isinstance(output, tuple):
+        return output[0]
+    return output
+
+
 def is_fused_eligible(
     *,
     loss_fn: str,
@@ -413,17 +427,19 @@ def fused_cross_entropy_forward_backward(
     liger = _try_import_liger() if cap.supports_liger else None
     if liger is not None:
         try:
-            loss = liger.apply(
-                flat_hidden,
-                lm_weight,
-                flat_labels,
-                lm_bias,
-                None,  # ce_weight
-                -100,  # ignore_index
-                0.0,  # lse_square_scale
-                0.0,  # label_smoothing
-                "mean",  # reduction
-                None,  # softcap
+            loss = _liger_loss_tensor(
+                liger.apply(
+                    flat_hidden,
+                    lm_weight,
+                    flat_labels,
+                    lm_bias,
+                    None,  # ce_weight
+                    -100,  # ignore_index
+                    0.0,  # lse_square_scale
+                    0.0,  # label_smoothing
+                    "mean",  # reduction
+                    None,  # softcap
+                )
             )
             (loss * loss_scale).backward()
             return loss.detach()
