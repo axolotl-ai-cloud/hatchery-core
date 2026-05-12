@@ -13,8 +13,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from transformers import AutoTokenizer
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
 
 from hatchery.core.distributed import destroy_distributed_runtime
 from hatchery.core.parallel import ParallelConfig

@@ -237,9 +237,7 @@ def is_fp8_torchao_model(hf_config: Any) -> bool:
     be ``False`` on the raw checkpoint config (pre-load) and ``True``
     on the loaded model config (post-quantization).
     """
-    return _quantization_config_is_fp8_torchao(
-        getattr(hf_config, "quantization_config", None)
-    )
+    return _quantization_config_is_fp8_torchao(getattr(hf_config, "quantization_config", None))
 
 
 def detect_quant_scheme(hf_config: Any, *, model_name: Optional[str] = None) -> QuantScheme:

@@ -31,8 +31,10 @@ def is_torchao_float8_tensor(tensor: Any) -> bool:
     without importing TorchAO at module import time.
     """
 
-    return type(tensor).__name__ == "Float8Tensor" and hasattr(tensor, "qdata") and hasattr(
-        tensor, "scale"
+    return (
+        type(tensor).__name__ == "Float8Tensor"
+        and hasattr(tensor, "qdata")
+        and hasattr(tensor, "scale")
     )
 
 

@@ -493,9 +493,7 @@ def _completion_logprobs(
 
     model_config = getattr(verifier_model, "config", None)
     pad_id = int(
-        getattr(model_config, "pad_token_id", None)
-        or getattr(model_config, "eos_token_id", 0)
-        or 0
+        getattr(model_config, "pad_token_id", None) or getattr(model_config, "eos_token_id", 0) or 0
     )
     max_len = max(len(prompt_tokens) + len(sequence) for sequence in sequences)
     rows: list[list[int]] = []
@@ -735,8 +733,7 @@ def run_dflash_sample(
             raw_output, prompt_len=prompt_len, tokenizer=tokenizer, stop_token_ids=stop_token_ids
         )
         sequences = [
-            [int(token) for token in sequence]
-            for sequence in result.get("sequences") or []
+            [int(token) for token in sequence] for sequence in result.get("sequences") or []
         ]
         sequence_logprobs = result.get("sequence_logprobs")
         if (

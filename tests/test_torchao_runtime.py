@@ -64,9 +64,9 @@ def test_torchao_float8_patch_and_manual_module_move():
 
     target = "cuda" if torch.cuda.is_available() else "cpu"
     move_module_tensors_without_apply(module, target)
-    assert {str(tensor.device) for tensor in list(module.parameters()) + list(module.buffers())} == {
-        str(torch.device(target))
-    }
+    assert {
+        str(tensor.device) for tensor in list(module.parameters()) + list(module.buffers())
+    } == {str(torch.device(target))}
 
     if torch.cuda.is_available():
         y = module(torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)).sum()
