@@ -975,7 +975,7 @@ async def get_server_capabilities():
         _try_import_liger,
         list_known_architectures,
     )
-    from hatchery.core.losses import DECLARED_LOSS_FNS, SUPPORTED_LOSS_FNS
+    from hatchery.core.losses import declared_loss_fns, supported_loss_fns
     from hatchery.core.model_registry import (
         _DEFAULT_CONTEXT,
     )
@@ -998,8 +998,8 @@ async def get_server_capabilities():
     ]
 
     return {
-        "supported_loss_fns": list(SUPPORTED_LOSS_FNS),
-        "declared_loss_fns": list(DECLARED_LOSS_FNS),
+        "supported_loss_fns": list(supported_loss_fns()),
+        "declared_loss_fns": list(declared_loss_fns()),
         "supports_forward_backward_custom": True,
         "supports_topk_prompt_logprobs": True,
         "supports_2d_target_tokens": True,
@@ -1141,7 +1141,7 @@ async def forward_backward(
     user: AuthenticatedUser = Depends(get_current_user),
     config: Config = Depends(get_config),
 ):
-    from hatchery.core.losses import DECLARED_LOSS_FNS, SUPPORTED_LOSS_FNS
+    from hatchery.core.losses import declared_loss_fns, is_registered, supported_loss_fns
 
     session = await _owned_session_for_model(config, req.model_id, user.user_id)
     raw_data = req.forward_backward_input.get("data", [])
@@ -1149,16 +1149,17 @@ async def forward_backward(
         raise HTTPException(400, "data must not be empty")
     loss_fn = req.forward_backward_input.get("loss_fn", "cross_entropy")
     loss_fn_config = req.forward_backward_input.get("loss_fn_config")
-    if loss_fn not in SUPPORTED_LOSS_FNS:
-        if loss_fn in DECLARED_LOSS_FNS:
+    if not is_registered(loss_fn):
+        supported = list(supported_loss_fns())
+        if loss_fn in declared_loss_fns():
             raise HTTPException(
                 501,
                 f"loss_fn {loss_fn!r} is declared by Tinker but not yet "
-                f"implemented server-side. Supported: {list(SUPPORTED_LOSS_FNS)}",
+                f"implemented server-side. Supported: {supported}",
             )
         raise HTTPException(
             400,
-            f"unknown loss_fn {loss_fn!r}. Supported: {list(SUPPORTED_LOSS_FNS)}",
+            f"unknown loss_fn {loss_fn!r}. Supported: {supported}",
         )
     data_items = await _build_data_items(raw_data)
 
@@ -1205,7 +1206,7 @@ async def forward_only(
     Token counts are still emitted so metering is uniform with
     forward_backward (matches Tinker's server-side metering).
     """
-    from hatchery.core.losses import DECLARED_LOSS_FNS, SUPPORTED_LOSS_FNS
+    from hatchery.core.losses import declared_loss_fns, is_registered, supported_loss_fns
 
     session = await _owned_session_for_model(config, req.model_id, user.user_id)
     raw_data = req.forward_only_input.get("data", [])
@@ -1213,16 +1214,17 @@ async def forward_only(
         raise HTTPException(400, "data must not be empty")
     loss_fn = req.forward_only_input.get("loss_fn", "cross_entropy")
     loss_fn_config = req.forward_only_input.get("loss_fn_config")
-    if loss_fn not in SUPPORTED_LOSS_FNS:
-        if loss_fn in DECLARED_LOSS_FNS:
+    if not is_registered(loss_fn):
+        supported = list(supported_loss_fns())
+        if loss_fn in declared_loss_fns():
             raise HTTPException(
                 501,
                 f"loss_fn {loss_fn!r} is declared by Tinker but not yet "
-                f"implemented server-side. Supported: {list(SUPPORTED_LOSS_FNS)}",
+                f"implemented server-side. Supported: {supported}",
             )
         raise HTTPException(
             400,
-            f"unknown loss_fn {loss_fn!r}. Supported: {list(SUPPORTED_LOSS_FNS)}",
+            f"unknown loss_fn {loss_fn!r}. Supported: {supported}",
         )
     data_items = await _build_data_items(raw_data)
 
