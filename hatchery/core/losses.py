@@ -85,13 +85,44 @@ Math
     Not implemented — the exact formulation is not in the public
     Tinker docs. Raises :class:`NotImplementedError` with a clear
     message. Contact the Tinker team for their specific DRO spec.
+
+Extending the registry
+----------------------
+
+Additional loss functions can be supplied by operator-installed Python
+packages without forking this module. A plugin package declares a
+``hatchery.losses`` entry point in its ``pyproject.toml``::
+
+    [project.entry-points."hatchery.losses"]
+    my_dpo = "my_pkg.losses:my_dpo"
+
+The registered callable must have the signature::
+
+    fn(inputs: LossInputs) -> Tensor | tuple[Tensor, dict]
+
+Plugins are discovered lazily the first time :func:`compute`,
+:func:`is_registered`, :func:`registered_loss_fns`, or
+:func:`supported_loss_fns` is called. A plugin whose ``ep.load()``
+raises is logged and skipped — a broken plugin will not bring down
+the worker.
+
+Tests and operator-internal code may also call :func:`register_loss`
+directly to install a loss in-process.
+
+**Trust model.** This is an operator-install-only surface: there is no
+user-uploadable code path, no gRPC/HTTP registration endpoint, and no
+sandboxing. Registered callables run inside the worker training
+process with full Python privileges. Install only trusted packages.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 try:  # pragma: no cover
     import torch
@@ -99,6 +130,20 @@ try:  # pragma: no cover
 except ImportError:
     torch = None  # type: ignore
     F = None  # type: ignore
+
+if TYPE_CHECKING:  # pragma: no cover
+    from torch import Tensor
+
+    LossFn = Callable[["LossInputs"], "Tensor | tuple[Tensor, dict]"]
+else:
+    LossFn = Callable[["LossInputs"], Any]
+
+logger = logging.getLogger(__name__)
+
+#: Entry-point group used to discover third-party loss plugins.
+LOSS_ENTRY_POINT_GROUP = "hatchery.losses"
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass
@@ -201,9 +246,174 @@ def _require_rl_inputs(loss_fn: str, old_logprobs: Any, advantages: Any) -> None
         raise ValueError(f"{loss_fn} requires 'advantages' in loss_fn_inputs")
 
 
+# ─── Registry ────────────────────────────────────────────────────────────
+
+_DRO_NOT_IMPLEMENTED_MESSAGE = (
+    "dro is declared by the Tinker API but the exact "
+    "formulation is not in the public docs. Contact "
+    "tinker@thinkingmachines.ai for their DRO spec, or "
+    "use forward_backward_custom to implement it client-side."
+)
+
+_REGISTRY: dict[str, LossFn] = {}
+_BUILTINS: frozenset[str] = frozenset()
+_ENTRY_POINTS_LOADED: bool = False
+
+
+def _register_builtins() -> None:
+    """Populate the registry with the in-tree loss functions.
+
+    Runs once at module import. The names registered here are the
+    fixed set built into core; plugin-supplied names cannot collide
+    with these unless the caller passes ``override=True`` to
+    :func:`register_loss`.
+    """
+    global _BUILTINS
+    builtins: dict[str, LossFn] = {
+        "cross_entropy": _cross_entropy,
+        "importance_sampling": _importance_sampling,
+        "ppo": _ppo,
+        "cispo": _cispo,
+        "grpo": _grpo,
+        "dapo": _dapo,
+        "gspo": _gspo,
+        "orpo": _orpo,
+    }
+    _REGISTRY.update(builtins)
+    _BUILTINS = frozenset(builtins)
+
+
+def _load_entry_points() -> None:
+    """Discover and register losses declared via the ``hatchery.losses`` entry-point group.
+
+    Failures in any individual plugin are logged and swallowed so a
+    broken third-party package can't take down the worker.
+    """
+    from importlib import metadata as importlib_metadata
+
+    try:
+        eps = importlib_metadata.entry_points()
+    except Exception:  # pragma: no cover - extremely unlikely
+        logger.exception("failed to enumerate entry points for loss plugins")
+        return
+
+    # Python 3.10+ exposes .select(group=...). Older returns a dict.
+    try:
+        group = eps.select(group=LOSS_ENTRY_POINT_GROUP)
+    except AttributeError:  # pragma: no cover - py<3.10 path
+        group = eps.get(LOSS_ENTRY_POINT_GROUP, [])
+
+    for ep in group:
+        try:
+            fn = ep.load()
+            register_loss(ep.name, fn)
+        except Exception:
+            logger.error(
+                "failed to load loss plugin %r from entry-point group %r",
+                getattr(ep, "name", "<unknown>"),
+                LOSS_ENTRY_POINT_GROUP,
+                exc_info=True,
+            )
+
+
+def _ensure_entry_points_loaded() -> None:
+    """Run entry-point discovery exactly once per process.
+
+    No lock is taken — the worker runs on CPython's single-threaded
+    asyncio loop, and dict operations / flag flips are atomic under
+    the GIL. The flag is set *before* the load runs so any concurrent
+    or re-entrant caller short-circuits immediately rather than
+    re-running discovery. If a future worker runs registry access
+    from multiple OS threads, add a ``threading.Lock`` here.
+    """
+    global _ENTRY_POINTS_LOADED
+    if _ENTRY_POINTS_LOADED:
+        return
+    # Set the flag *before* loading so a re-entrant call (e.g. from a
+    # plugin's own register_loss path) doesn't recurse.
+    _ENTRY_POINTS_LOADED = True
+    _load_entry_points()
+
+
+def register_loss(name: str, fn: LossFn, *, override: bool = False) -> None:
+    """Register a loss function under ``name``.
+
+    Parameters
+    ----------
+    name:
+        Public dispatch name. Must be a non-empty Python identifier.
+    fn:
+        Callable with signature ``fn(inputs: LossInputs) -> Tensor | tuple[Tensor, dict]``.
+    override:
+        If ``True``, allows replacing an existing built-in or
+        previously-registered entry. Defaults to ``False``.
+
+    Raises
+    ------
+    ValueError
+        If ``name`` is not a valid identifier, or if it collides with
+        an existing built-in and ``override`` is False.
+    """
+    if not isinstance(name, str) or not name or not _IDENTIFIER_RE.match(name):
+        raise ValueError(f"loss_fn name must be a non-empty Python identifier; got {name!r}")
+    if not callable(fn):
+        raise ValueError(f"loss_fn {name!r} must be callable; got {type(fn).__name__}")
+    if not override and name in _BUILTINS:
+        raise ValueError(
+            f"loss_fn {name!r} collides with a built-in; pass override=True to replace it"
+        )
+    _REGISTRY[name] = fn
+
+
+def unregister_loss(name: str) -> None:
+    """Remove a previously-registered loss.
+
+    Raises
+    ------
+    ValueError
+        If ``name`` is a built-in (built-ins cannot be removed).
+    KeyError
+        If ``name`` is not currently registered.
+    """
+    if name in _BUILTINS:
+        raise ValueError(f"loss_fn {name!r} is a built-in and cannot be unregistered")
+    del _REGISTRY[name]
+
+
+def is_registered(name: str) -> bool:
+    """Return True if ``name`` is currently dispatchable via :func:`compute`."""
+    _ensure_entry_points_loaded()
+    return name in _REGISTRY
+
+
+def registered_loss_fns() -> tuple[str, ...]:
+    """Return all currently-registered loss names (built-ins + plugins), sorted."""
+    _ensure_entry_points_loaded()
+    return tuple(sorted(_REGISTRY))
+
+
+def supported_loss_fns() -> tuple[str, ...]:
+    """Alias for :func:`registered_loss_fns` — names the server can actually run.
+
+    Prefer this over the static :data:`SUPPORTED_LOSS_FNS` tuple when
+    advertising capabilities to clients, since this reflects any
+    plugins discovered via the ``hatchery.losses`` entry-point group.
+    """
+    return registered_loss_fns()
+
+
+def declared_loss_fns() -> tuple[str, ...]:
+    """Return the registered names plus declared-but-unimplemented ``dro``, sorted."""
+    return tuple(sorted({*registered_loss_fns(), "dro"}))
+
+
 # ─── Dispatch ────────────────────────────────────────────────────────────
 
 
+# Static built-in lists. These reflect ONLY the in-tree built-ins and
+# are kept for backwards compatibility with code that imports the
+# names directly. For the live, plugin-inclusive view use
+# :func:`supported_loss_fns` / :func:`declared_loss_fns`.
 SUPPORTED_LOSS_FNS = (
     "cross_entropy",
     "importance_sampling",
@@ -229,31 +439,19 @@ def compute(loss_fn: str, inputs: LossInputs) -> Any:
     ValueError
         If the loss name is unknown.
     LossNotImplementedError
-        For ``dro`` (declared but not implemented).
+        For ``dro`` when no implementation has been registered (declared
+        in the public Tinker API but not shipped server-side). An
+        operator who registers their own ``"dro"`` via
+        :func:`register_loss` (``override=True`` is not required —
+        ``"dro"`` is not a built-in) takes priority over the
+        not-implemented sentinel.
     """
-    if loss_fn == "cross_entropy":
-        return _cross_entropy(inputs)
-    if loss_fn == "importance_sampling":
-        return _importance_sampling(inputs)
-    if loss_fn == "ppo":
-        return _ppo(inputs)
-    if loss_fn == "cispo":
-        return _cispo(inputs)
-    if loss_fn == "grpo":
-        return _grpo(inputs)
-    if loss_fn == "dapo":
-        return _dapo(inputs)
-    if loss_fn == "gspo":
-        return _gspo(inputs)
-    if loss_fn == "orpo":
-        return _orpo(inputs)
+    _ensure_entry_points_loaded()
+    fn = _REGISTRY.get(loss_fn)
+    if fn is not None:
+        return fn(inputs)
     if loss_fn == "dro":
-        raise LossNotImplementedError(
-            "dro is declared by the Tinker API but the exact "
-            "formulation is not in the public docs. Contact "
-            "tinker@thinkingmachines.ai for their DRO spec, or "
-            "use forward_backward_custom to implement it client-side."
-        )
+        raise LossNotImplementedError(_DRO_NOT_IMPLEMENTED_MESSAGE)
     raise ValueError(f"unknown loss_fn: {loss_fn!r}")
 
 
@@ -600,3 +798,10 @@ def surrogate_loss_from_grad(logprobs: Any, grad_logprobs: Any) -> Any:
             f"grad_logprobs shape {tuple(grad_logprobs.shape)}"
         )
     return (logprobs * grad_logprobs.detach()).sum()
+
+
+# ─── Built-in registration ──────────────────────────────────────────────
+#
+# Built-ins are registered after the loss function bodies are defined so
+# the registry holds the actual callables, not forward references.
+_register_builtins()

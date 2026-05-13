@@ -2003,7 +2003,7 @@ class GPUWorker:
         usage tracking charges a forward pass uniformly with
         forward_backward (matches Tinker's wire semantics).
         """
-        from hatchery.core.losses import DECLARED_LOSS_FNS, SUPPORTED_LOSS_FNS
+        from hatchery.core.losses import declared_loss_fns, is_registered
 
         runtime = await self._ensure_session_loaded(session_id)
         model = self._activate_session(session_id, runtime)
@@ -2016,8 +2016,8 @@ class GPUWorker:
         data_items = payload["data"]
         if not data_items:
             raise ValueError("forward_only requires non-empty 'data'")
-        if loss_fn not in SUPPORTED_LOSS_FNS:
-            if loss_fn in DECLARED_LOSS_FNS:
+        if not is_registered(loss_fn):
+            if loss_fn in declared_loss_fns():
                 raise ValueError(f"loss_fn {loss_fn!r} is declared but not implemented server-side")
             raise ValueError(f"unknown loss_fn {loss_fn!r}")
 
