@@ -36,8 +36,10 @@ def test_core_config_default_keeps_runtime_optimizations_empty():
 
 def test_scattermoe_kernel_applies_for_supported_model_when_available(monkeypatch):
     calls: dict[str, object] = {}
+    registered: dict[str, object] = {}
+    replaced: list[tuple[type, str]] = []
 
-    def fake_get_kernel(kernel_ref: str):
+    def fake_get_kernel(kernel_ref: str, **_kw):
         calls["get_kernel"] = kernel_ref
         return object()
 
@@ -46,12 +48,39 @@ def test_scattermoe_kernel_applies_for_supported_model_when_available(monkeypatc
         calls["mode"] = mode
         model.kernelized = True
 
+    class FakeLayerRepository:
+        def __init__(self, *, repo_id: str, layer_name: str, **_kw):
+            self.repo_id = repo_id
+            self.layer_name = layer_name
+
+    def fake_register_kernel_mapping(mapping):
+        registered.update(mapping)
+
+    def fake_replace_kernel_forward_from_hub(cls, key):
+        replaced.append((cls, key))
+
+    # Patch the transformers MoE class lookup so the test doesn't need
+    # transformers' real qwen3_5_moe internals.
+    class FakeQwenMoeBlock:
+        pass
+
+    monkeypatch.setattr(
+        "hatchery.core.scattermoe_kernel.SPARSE_MOE_BLOCK",
+        {"qwen3_5_moe": [(FakeQwenMoeBlock.__module__, FakeQwenMoeBlock.__name__)]},
+    )
+    monkeypatch.setattr(
+        "hatchery.core.scattermoe_kernel._resolve_moe_block_classes",
+        lambda model_type: [FakeQwenMoeBlock],
+    )
     monkeypatch.setattr(
         "hatchery.core.scattermoe_kernel._try_import_kernels",
         lambda: {
+            "LayerRepository": FakeLayerRepository,
+            "Mode": SimpleNamespace(TRAINING="training", INFERENCE="inference"),
             "get_kernel": fake_get_kernel,
             "kernelize": fake_kernelize,
-            "Mode": SimpleNamespace(TRAINING="training"),
+            "register_kernel_mapping": fake_register_kernel_mapping,
+            "replace_kernel_forward_from_hub": fake_replace_kernel_forward_from_hub,
         },
     )
 
@@ -83,6 +112,9 @@ def test_scattermoe_kernel_applies_for_supported_model_when_available(monkeypatc
     assert calls["get_kernel"] == "kernels-test/scattermoe"
     assert calls["mode"] == "training"
     assert model.kernelized is True
+    # New: registration + replacement actually happened.
+    assert "HFScatterMoEParallelExperts" in registered
+    assert (FakeQwenMoeBlock, "HFScatterMoEParallelExperts") in replaced
 
 
 def test_scattermoe_kernel_falls_back_when_missing_and_not_strict(monkeypatch):
