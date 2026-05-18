@@ -204,15 +204,23 @@ def _new_logprobs_at_targets(logits, target_tokens):
     """
     valid = target_tokens.ne(-100)
     safe_targets = target_tokens.masked_fill(~valid, 0)
-    log_probs = F.log_softmax(logits.float(), dim=-1)  # [B, T, V]
+    log_denominator = torch.logsumexp(logits, dim=-1).float()
 
-    if safe_targets.dim() == log_probs.dim() - 1:
+    def _match_prefix(tensor, shape):
+        if tuple(tensor.shape) == tuple(shape):
+            return tensor
+        return tensor[tuple(slice(0, int(size)) for size in shape)]
+
+    if safe_targets.dim() == logits.dim() - 1:
         # 1-D: one target index per position.
-        gathered = log_probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
-    elif safe_targets.dim() == log_probs.dim():
-        # 2-D: K target indices per position. log_probs is [B, T, V];
+        target_logits = logits.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1).float()
+        gathered = target_logits - _match_prefix(log_denominator, target_logits.shape)
+    elif safe_targets.dim() == logits.dim():
+        # 2-D: K target indices per position. logits is [B, T, V];
         # safe_targets is [B, T, K]; gather along V gives [B, T, K].
-        gathered = log_probs.gather(-1, safe_targets)
+        target_logits = logits.gather(-1, safe_targets).float()
+        denominator = _match_prefix(log_denominator, target_logits.shape[:-1])
+        gathered = target_logits - denominator.unsqueeze(-1)
     else:
         raise ValueError(
             f"target_tokens shape {tuple(target_tokens.shape)} incompatible "
