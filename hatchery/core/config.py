@@ -282,7 +282,7 @@ def build_core_config() -> Config:
             ),
             kernel_ref=os.environ.get(
                 "HATCHERY_SCATTERMOE_KERNEL_REF",
-                os.environ.get("SCATTERMOE_KERNEL_REF", "axolotl-ai-co/scattermoe"),
+                os.environ.get("SCATTERMOE_KERNEL_REF", "axolotl-ai-co/scattermoe-lora"),
             ),
             strict=_env_bool(
                 "HATCHERY_SCATTERMOE_KERNEL_STRICT",

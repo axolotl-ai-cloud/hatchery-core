@@ -78,9 +78,7 @@ def _resolve_moe_block_classes(model_type: str) -> list[type]:
     for cls_name in cls_names:
         moe_cls = getattr(module, cls_name, None)
         if moe_cls is None:
-            raise ValueError(
-                f"Could not find class '{cls_name}' in '{module_path}'"
-            )
+            raise ValueError(f"Could not find class '{cls_name}' in '{module_path}'")
         classes.append(moe_cls)
     return classes
 
