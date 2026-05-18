@@ -73,6 +73,37 @@ def _build_config(api_key: str) -> Config:
         max_concurrent_sessions=100,
         max_rank=256,
     )
+    scattermoe_kernel = None
+    if any(
+        name in os.environ
+        for name in (
+            "HATCHERY_SCATTERMOE_KERNEL_ENABLED",
+            "HATCHERY_SCATTERMOE_KERNEL_REF",
+            "HATCHERY_SCATTERMOE_KERNEL_STRICT",
+            "HATCHERY_SCATTERMOE_KERNEL_TRUST_REMOTE_CODE",
+            "SCATTERMOE_KERNEL_ENABLED",
+            "SCATTERMOE_KERNEL_REF",
+            "SCATTERMOE_KERNEL_STRICT",
+        )
+    ):
+        from hatchery.core.config import _env_bool
+        from hatchery.core.scattermoe_kernel import ScatterMoEKernelConfig
+
+        scattermoe_kernel = ScatterMoEKernelConfig(
+            enabled=_env_bool(
+                "HATCHERY_SCATTERMOE_KERNEL_ENABLED",
+                _env_bool("SCATTERMOE_KERNEL_ENABLED"),
+            ),
+            kernel_ref=os.environ.get(
+                "HATCHERY_SCATTERMOE_KERNEL_REF",
+                os.environ.get("SCATTERMOE_KERNEL_REF", "axolotl-ai-co/scattermoe-lora"),
+            ),
+            strict=_env_bool(
+                "HATCHERY_SCATTERMOE_KERNEL_STRICT",
+                _env_bool("SCATTERMOE_KERNEL_STRICT"),
+            ),
+            trust_remote_code=_env_bool("HATCHERY_SCATTERMOE_KERNEL_TRUST_REMOTE_CODE", True),
+        )
     return Config(
         auth=auth,
         metadata=InMemoryMetadataStore(),
@@ -80,6 +111,7 @@ def _build_config(api_key: str) -> Config:
         queue=InMemoryJobQueue(),
         compute=LocalComputeBackend(),
         metrics=LogMetrics(),
+        scattermoe_kernel=scattermoe_kernel,
     )
 
 

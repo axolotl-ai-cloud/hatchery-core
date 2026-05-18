@@ -27,6 +27,7 @@ Design notes:
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import uuid
@@ -1113,7 +1114,8 @@ async def create_model(
         priority=10,
         required_model=req.base_model,
     )
-    result = await config.queue.wait_for_result(job.job_id, timeout=120.0)
+    init_timeout = float(os.environ.get("HATCHERY_CREATE_MODEL_TIMEOUT", "600"))
+    result = await config.queue.wait_for_result(job.job_id, timeout=init_timeout)
     await run_post_op_hooks(config, pre_op_ctx, record, user, result)
     if result.status != JobStatus.COMPLETED:
         await config.metadata.update_session(model_id, status=SessionStatus.FAILED)

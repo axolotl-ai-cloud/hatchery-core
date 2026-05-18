@@ -154,3 +154,27 @@ def test_build_core_config_populates_scattermoe_kernel(monkeypatch):
     assert config.scattermoe_kernel.enabled is True
     assert config.scattermoe_kernel.kernel_ref == "kernels-test/scattermoe"
     assert config.scattermoe_kernel.strict is True
+
+
+def test_build_core_config_uses_scattermoe_lora_default_ref(monkeypatch):
+    monkeypatch.setenv("HATCHERY_SCATTERMOE_KERNEL_ENABLED", "1")
+
+    config = build_core_config()
+
+    assert config.scattermoe_kernel is not None
+    assert config.scattermoe_kernel.kernel_ref == "axolotl-ai-co/scattermoe-lora"
+
+
+def test_local_dev_config_honors_scattermoe_kernel_env(monkeypatch):
+    from hatchery.core.local_dev import _build_config
+
+    monkeypatch.setenv("SCATTERMOE_KERNEL_ENABLED", "1")
+    monkeypatch.setenv("SCATTERMOE_KERNEL_STRICT", "true")
+
+    config = _build_config("dev")
+
+    assert config.scattermoe_kernel is not None
+    assert config.scattermoe_kernel.enabled is True
+    assert config.scattermoe_kernel.kernel_ref == "axolotl-ai-co/scattermoe-lora"
+    assert config.scattermoe_kernel.strict is True
+    assert config.scattermoe_kernel.trust_remote_code is True

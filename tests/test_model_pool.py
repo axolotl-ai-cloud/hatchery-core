@@ -12,6 +12,8 @@ validate with dict-shaped fakes.
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -214,6 +216,57 @@ def test_vlm_helpers_detect_class_name():
 
     assert _is_vlm_model(FakeQwen2VL()) is True
     assert _is_vlm_model(FakeLlama()) is False
+
+
+def test_rewrap_pool_falls_back_to_image_text_model_loader(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    class _FakeModel:
+        config = object()
+
+        def gradient_checkpointing_enable(self):
+            pass
+
+        def enable_input_require_grads(self):
+            pass
+
+        def eval(self):
+            pass
+
+        def parameters(self):
+            return []
+
+    class _FakeCausalLM:
+        @staticmethod
+        def from_pretrained(name: str, **_kwargs):
+            calls.append(("causal", name))
+            raise ValueError("unrecognized configuration class")
+
+    class _FakeImageTextToText:
+        @staticmethod
+        def from_pretrained(name: str, **_kwargs):
+            calls.append(("image_text", name))
+            return _FakeModel()
+
+    class _FakeTokenizer:
+        pad_token = "<pad>"
+        eos_token = "</s>"
+
+        @staticmethod
+        def from_pretrained(_name: str):
+            return _FakeTokenizer()
+
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.AutoModelForCausalLM = _FakeCausalLM
+    fake_transformers.AutoModelForImageTextToText = _FakeImageTextToText
+    fake_transformers.AutoTokenizer = _FakeTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    pool = RewrapModelPool(max_slots=1, device=None, attn_implementation=None)
+    slot = pool.get_or_load("vlm-wrapper")
+
+    assert isinstance(slot.raw_base, _FakeModel)
+    assert calls == [("causal", "vlm-wrapper"), ("image_text", "vlm-wrapper")]
 
 
 def test_vision_token_ids_collects_image_markers():

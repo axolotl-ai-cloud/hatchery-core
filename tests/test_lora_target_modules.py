@@ -1,4 +1,5 @@
 """Tests for the model_type fallback in lora_target_modules."""
+
 from __future__ import annotations
 
 from hatchery.core.lora_target_modules import (
@@ -9,7 +10,6 @@ from hatchery.core.lora_target_modules import (
     _resolve,
     target_modules_for,
 )
-
 
 # ── name-based resolution (existing behavior) ───────────────────────────
 
@@ -98,7 +98,5 @@ def test_target_modules_for_includes_unembed():
 
 
 def test_target_modules_for_dedupes():
-    out = target_modules_for(
-        "moonshotai/Kimi-K2.5-Instruct", train_attn=True, train_mlp=True
-    )
+    out = target_modules_for("moonshotai/Kimi-K2.5-Instruct", train_attn=True, train_mlp=True)
     assert len(out) == len(set(out))

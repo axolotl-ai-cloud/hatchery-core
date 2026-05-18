@@ -300,7 +300,10 @@ class RewrapModelPool:
         if self.attn_implementation:
             kwargs["attn_implementation"] = self.attn_implementation
         kwargs = _maybe_adjust_kwargs_for_quant(base_model_name, kwargs, self._quant_config)
-        raw = AutoModelForCausalLM.from_pretrained(base_model_name, **kwargs)
+        try:
+            raw = AutoModelForCausalLM.from_pretrained(base_model_name, **kwargs)
+        except ValueError:
+            raw = _load_image_text_to_text_as_causal_lm(base_model_name, kwargs)
         if self.device:
             raw = raw.to(self.device)
         raw.gradient_checkpointing_enable()
@@ -748,6 +751,20 @@ def _maybe_adjust_kwargs_for_quant(
     if scheme == "onebit":
         return prepare_onebit_loader_kwargs(kwargs)
     return kwargs
+
+
+def _load_image_text_to_text_as_causal_lm(base_model_name: str, kwargs: dict[str, Any]) -> Any:
+    """Fallback for text-only use of multimodal wrapper configs.
+
+    Some VLM configs are not registered in ``AutoModelForCausalLM`` even though their
+    conditional-generation class can serve text-only calls when no image inputs are
+    provided.
+    """
+    try:
+        from transformers import AutoModelForImageTextToText
+    except ImportError:
+        raise
+    return AutoModelForImageTextToText.from_pretrained(base_model_name, **kwargs)
 
 
 def build_default_model_pool(
