@@ -1,0 +1,55 @@
+[[runtimes]]
+name = "cpython-3.12"
+python_implementation = "cpython@3.12.13"
+requirements = []
+platforms = [
+    "linux_x86_64",
+]
+
+[[frameworks]]
+name = "hatchery-ml"
+runtime = "cpython-3.12"
+requirements = [
+    "torch==2.10",
+    "transformers>=4.51",
+    "peft>=0.10",
+]
+dynlib_exclude = [
+    "triton/**",
+]
+platforms = [
+    "linux_x86_64",
+]
+
+[[applications]]
+name = "hatchery-local-dev"
+launch_module = "launch/hatchery_local_dev.py"
+frameworks = ["hatchery-ml"]
+requirements = [
+    "hatchery-core==0.1.0",
+]
+platforms = [
+    "linux_x86_64",
+]
+
+[[applications]]
+name = "hatchery-gateway"
+launch_module = "launch/hatchery_gateway.py"
+frameworks = ["hatchery-ml"]
+requirements = [
+    "hatchery-core==0.1.0",
+]
+platforms = [
+    "linux_x86_64",
+]
+
+[[applications]]
+name = "hatchery-worker"
+launch_module = "launch/hatchery_worker.py"
+frameworks = ["hatchery-ml"]
+requirements = [
+    "hatchery-core==0.1.0",
+]
+platforms = [
+    "linux_x86_64",
+]

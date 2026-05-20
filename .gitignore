@@ -17,6 +17,9 @@ scripts/
 !tests/torch_distributed/scripts/**
 build/
 dist/
+packaging/venvstacks/_artifacts/
+packaging/venvstacks/_build/
+packaging/venvstacks/wheelhouse/
 
 # Working docs — not committed. Ignore all markdown by default; opt in with `!`.
 *.md
