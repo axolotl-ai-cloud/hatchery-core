@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
 
+from hatchery.core._peft_compat import ensure_peft_torchao_lora_compat
 from hatchery.core.batching import (
     BatchStrategy,
     prepare_batch_for_dp,
@@ -1369,6 +1370,31 @@ class GPUWorker:
                 k: v.clone() for k, v in self._slot.pristine_sd.items()
             }
 
+    def _align_lora_dtype_for_torchao_float8(self, adapter: str) -> None:
+        """Keep an adapter's LoRA params in the base compute dtype on torchao-float8 bases.
+
+        peft upcasts LoRA to fp32 by default; over a torchao float8 base (the optional
+        FP8 requant path) that breaks the float8 matmul — fp32 activations vs the
+        bf16-logical weight — and training diverges. Only fires when the base actually
+        carries torchao tensors, so ordinary bf16/fp16 LoRA is untouched.
+        """
+        if self.dtype is None or self._peft is None:
+            return
+        try:
+            from torchao.utils import TorchAOBaseTensor
+        except Exception:
+            return
+        if not any(isinstance(p, TorchAOBaseTensor) for p in self._raw_base.parameters()):
+            return
+        for name, p in self._peft.named_parameters():
+            if (
+                "lora_" in name
+                and adapter in name
+                and p.is_floating_point()
+                and p.dtype != self.dtype
+            ):
+                p.data = p.data.to(self.dtype)
+
     def _attach_adapter(
         self,
         session_id: str,
@@ -1376,12 +1402,16 @@ class GPUWorker:
         state_dict: dict,
     ) -> None:
         adapter = self._adapter_name(session_id)
+        # Patch peft<->torchao skew before adapter injection: a base quantized via
+        # torchao.quantize_() (optional FP8 requant path) otherwise crashes here.
+        ensure_peft_torchao_lora_compat()
         first_adapter = self._peft is None
         if first_adapter:
             self._peft = get_peft_model(self._raw_base, lora_config, adapter_name=adapter)
         elif adapter not in self._peft.peft_config:
             self._peft.add_adapter(adapter, lora_config)
         self._peft.set_adapter(adapter)
+        self._align_lora_dtype_for_torchao_float8(adapter)
 
         if state_dict:
             set_peft_model_state_dict(self._peft, state_dict, adapter_name=adapter)

@@ -300,12 +300,42 @@ class RewrapModelPool:
         if self.attn_implementation:
             kwargs["attn_implementation"] = self.attn_implementation
         kwargs = _maybe_adjust_kwargs_for_quant(base_model_name, kwargs, self._quant_config)
+        # HF's fine-grained FP8 (FP8Linear) kernels are inference-only — no
+        # backward pass — so LoRA can't train through them (autograd needs
+        # grad-w.r.t.-input even with the base frozen). Dequantize the on-disk
+        # FP8 weights back to dtype at load so LoRA attaches over plain bf16
+        # linears. To keep the base in FP8 *and* train LoRA, use the
+        # autograd-compatible TorchAO path instead (scheme="fp8_torchao"), or
+        # opt into re-quantizing this dequantized base to TorchAO FP8 via
+        # HATCHERY_FP8_REQUANT_TORCHAO (see _maybe_requant_finegrained_fp8_to_torchao).
+        was_finegrained_fp8 = False
+        try:
+            from transformers import AutoConfig
+
+            _cfg = AutoConfig.from_pretrained(base_model_name)
+            qc = getattr(_cfg, "quantization_config", None)
+            if isinstance(qc, dict) and qc.get("quant_method") == "fp8":
+                was_finegrained_fp8 = True
+                if not qc.get("dequantize"):
+                    _cfg.quantization_config = {**qc, "dequantize": True}
+                    kwargs["config"] = _cfg
+        except Exception:
+            pass
+
         try:
             raw = AutoModelForCausalLM.from_pretrained(base_model_name, **kwargs)
         except ValueError:
             raw = _load_image_text_to_text_as_causal_lm(base_model_name, kwargs)
+        if was_finegrained_fp8 and self.dtype is not None:
+            # FineGrainedFP8 dequantize restores the affected layers in fp32
+            # regardless of torch_dtype, leaving the base mixed-precision (fp32
+            # quantized layers vs dtype everywhere else) and breaking matmuls.
+            # Cast back to the compute dtype so the base is consistent (and so an
+            # optional requant below quantizes from dtype weights, not fp32).
+            raw = raw.to(self.dtype)
         if self.device:
             raw = raw.to(self.device)
+        raw = _maybe_requant_finegrained_fp8_to_torchao(raw, was_finegrained_fp8)
         raw.gradient_checkpointing_enable()
         raw.enable_input_require_grads()
         raw.eval()
@@ -751,6 +781,67 @@ def _maybe_adjust_kwargs_for_quant(
     if scheme == "onebit":
         return prepare_onebit_loader_kwargs(kwargs)
     return kwargs
+
+
+def _maybe_requant_finegrained_fp8_to_torchao(raw: Any, was_finegrained_fp8: bool) -> Any:
+    """Opt-in: re-quantize a dequantized fine-grained-FP8 base to TorchAO FP8.
+
+    HF fine-grained FP8 checkpoints can't be LoRA-trained in place (``FP8Linear``
+    is inference-only), so :meth:`RewrapModelPool._load_base` dequantizes them to
+    bf16 — which gives up the FP8 memory footprint. When
+    ``HATCHERY_FP8_REQUANT_TORCHAO`` is truthy, re-quantize the live bf16 module to
+    TorchAO float8 (autograd-compatible, so LoRA still trains) to claw that back.
+
+    Opt-in, not automatic, because of the trade-offs:
+
+    * Numerics diverge — this is a *fresh* tensorwise float8 quantization of the
+      dequantized bf16 weights, not the checkpoint's original blockwise fine-grained
+      FP8.
+    * No load-peak savings — the full bf16 base is materialized before requant;
+      only steady-state memory drops (~half).
+    * Requires FP8-capable hardware (Ada/Hopper/Blackwell, CUDA capability >= 8.9).
+
+    The output embedding (``lm_head``) is deliberately left unquantized: fp8 on the
+    vocab projection wrecks training (loss diverges), and it must also stay a plain
+    ``nn.Linear`` so the bf16 logits path / fused loss works. LoRA over the float8
+    layers must be kept in ``dtype`` (not fp32) by the caller; see
+    :meth:`hatchery.core.worker.GPUWorker._attach_adapter`.
+
+    Best-effort: any failure (missing torchao, wrong hardware, kernel error) falls
+    back to the already-loaded bf16 module rather than erroring the load.
+    """
+    if not was_finegrained_fp8:
+        return raw
+    if os.environ.get("HATCHERY_FP8_REQUANT_TORCHAO", "").lower() not in {"1", "true", "yes", "on"}:
+        return raw
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return raw
+        try:
+            dev = next(raw.parameters()).device
+        except StopIteration:
+            return raw
+        if dev.type != "cuda" or torch.cuda.get_device_capability(dev) < (8, 9):
+            return raw
+        from torchao.quantization import Float8WeightOnlyConfig, quantize_
+
+        # Quantize Linear layers only, excluding the output embedding (lm_head).
+        out_emb = None
+        try:
+            out_emb = raw.get_output_embeddings()
+        except Exception:
+            out_emb = None
+
+        def _is_quantizable_linear(module: Any, _fqn: str) -> bool:
+            return isinstance(module, torch.nn.Linear) and module is not out_emb
+
+        quantize_(raw, Float8WeightOnlyConfig(), filter_fn=_is_quantizable_linear)
+    except Exception:
+        # Keep the bf16 base; requant is a best-effort memory optimization.
+        return raw
+    return raw
 
 
 def _load_image_text_to_text_as_causal_lm(base_model_name: str, kwargs: dict[str, Any]) -> Any:
