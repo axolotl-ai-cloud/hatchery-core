@@ -338,6 +338,43 @@ class LoadWeightsRequest(BaseModel):
     type: str = "load_weights"
 
 
+class CreateSamplingSessionRequest(BaseModel):
+    """Spin up a fresh sampler-only session for inference.
+
+    Mirrors the official Tinker ``ServiceClient.create_sampling_client``
+    signature: at least one of ``base_model`` / ``model_path`` must be
+    provided; when both are set, ``model_path`` wins (the effective
+    ``base_model`` is derived from the checkpoint's parent session
+    record). ``ttl_seconds`` controls the advertised ``expires_at`` —
+    purely informational at the gateway layer; lifecycle of the
+    underlying session is governed by the existing session machinery.
+
+    ``session_id`` and ``sampling_session_seq_id`` are accepted for
+    bytes-on-the-wire parity with the official ``tinker`` SDK (whose
+    schema requires them — see ``tinker/types/create_sampling_session_request.py``).
+    The seq id, when supplied, is embedded in the returned
+    ``sampling_session_id`` so retries are idempotent the way
+    ``save_weights_for_sampler`` already is; ``session_id`` is echoed
+    back on the response for the SDK's bookkeeping but doesn't gate
+    creation of the underlying sampler session.
+    """
+
+    base_model: Optional[str] = None
+    model_path: Optional[str] = None
+    ttl_seconds: Optional[int] = Field(None, ge=1)
+    # Tinker-SDK-shape metadata fields. Optional here so Hatchery's own
+    # client doesn't need to supply them; required by the tinker schema.
+    session_id: Optional[str] = None
+    sampling_session_seq_id: Optional[int] = None
+    type: str = "create_sampling_session"
+
+    @model_validator(mode="after")
+    def _require_at_least_one(self) -> CreateSamplingSessionRequest:
+        if self.base_model is None and self.model_path is None:
+            raise ValueError("either base_model or model_path is required")
+        return self
+
+
 class RetrieveFutureRequest(BaseModel):
     # Accept either our historical ``future_id`` or the tinker SDK's
     # ``request_id`` (both are Optional so Pydantic lets us pick one).
@@ -1135,6 +1172,195 @@ async def create_model(
         model_seq_id=req.model_seq_id,
     )
     return resp
+
+
+async def _resolve_sampler_model_path(
+    config: Config, model_path: str, user: AuthenticatedUser
+) -> tuple[str, Optional[str]]:
+    """Resolve ``model_path`` to ``(effective_base_model, optional checkpoint_prefix)``.
+
+    Two accepted forms:
+
+    * ``tinker://{parent_model_id}/{kind}/{name}`` — look up the parent
+      session's ``base_model`` and point the sampler at the materialized
+      checkpoint prefix under ``sessions/{parent_model_id}/checkpoints/{name}``.
+      ``kind`` is one of ``checkpoints`` or ``sampler_weights`` (matching
+      the formats minted by ``save_state`` and ``save_weights_for_sampler``);
+      either resolves to the same on-disk layout because both writers use
+      the same ``checkpoints/{name}`` prefix.
+    * **Local FS or HF id** — the string is forwarded as ``base_model``
+      and the worker's model pool drives the usual HF loader, which
+      accepts both Hub identifiers and on-disk paths. No separate
+      ``load_weights`` step is needed in this branch because the
+      checkpoint *is* the base.
+    """
+    if model_path.startswith("tinker://"):
+        rel = model_path[len("tinker://") :]
+        parts = rel.split("/", 2)
+        if len(parts) < 3:
+            raise HTTPException(400, f"malformed model_path: {model_path!r}")
+        parent_model_id, kind, name = parts[0], parts[1], parts[2]
+        if kind not in {"checkpoints", "sampler_weights"}:
+            raise HTTPException(
+                400,
+                f"unsupported model_path kind {kind!r}; "
+                f"expected 'checkpoints' or 'sampler_weights'",
+            )
+        parent_session = await config.metadata.get_session(parent_model_id)
+        if parent_session is None:
+            raise HTTPException(404, f"checkpoint parent session not found: {parent_model_id}")
+        if parent_session.user_id != user.user_id:
+            raise HTTPException(403, "checkpoint owned by a different user")
+        ckpt_prefix = f"{config.sessions_prefix}/{parent_model_id}/checkpoints/{name}"
+        return parent_session.base_model, ckpt_prefix
+    return model_path, None
+
+
+@router.post("/create_sampling_session")
+async def create_sampling_session(
+    req: CreateSamplingSessionRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    config: Config = Depends(get_config),
+):
+    """Create a sampler-only session for inference.
+
+    Mirrors the official Tinker ``ServiceClient.create_sampling_client``:
+    callers pass either a ``base_model`` (HF id or local path) or a
+    ``model_path`` URI pointing at a saved checkpoint; this endpoint
+    spins up a fresh full-parameter session, optionally loads the
+    referenced weights on top, and returns a ``sampling_session_id`` in
+    the same wire format ``save_weights_for_sampler`` uses so the
+    existing ``/asample`` decoder works unchanged.
+
+    The session is full-param (no LoRA) — sampler clients are read-only
+    by contract, so giving them a trainable adapter would be misleading.
+    The model pool's "one base load, many sessions" property means this
+    shares VRAM with any concurrent training session on the same base.
+    """
+    effective_base_model = req.base_model
+    checkpoint_prefix: Optional[str] = None
+    if req.model_path is not None:
+        effective_base_model, checkpoint_prefix = await _resolve_sampler_model_path(
+            config, req.model_path, user
+        )
+
+    assert effective_base_model is not None  # validator guarantees this
+
+    if (
+        user.allowed_models is not None
+        and not effective_base_model.startswith("/")
+        and effective_base_model not in user.allowed_models
+    ):
+        # Local FS paths bypass the allow-list — operator-controlled
+        # filesystems are an implicit grant. HF ids must be on the list.
+        raise HTTPException(403, f"Model not allowed: {effective_base_model}")
+
+    existing = await config.metadata.list_sessions(
+        user_id=user.user_id, status=SessionStatus.ACTIVE
+    )
+    if len(existing) >= user.max_concurrent_sessions:
+        raise HTTPException(429, f"Max {user.max_concurrent_sessions} concurrent sessions")
+
+    model_id = f"smp_{uuid.uuid4().hex}"
+    record = SessionRecord(
+        session_id=model_id,
+        user_id=user.user_id,
+        base_model=effective_base_model,
+        # Full-param shape: rank None signals "no adapter" to
+        # _handle_init_session's FFT branch (worker.py:1673).
+        lora_rank=None,
+        lora_alpha=0,
+        target_modules=[],
+        total_steps=0,
+        accum_steps=0,
+        created_at=time.time(),
+        last_accessed=time.time(),
+        status=SessionStatus.ACTIVE,
+        state_prefix=f"{config.sessions_prefix}/{model_id}/live_state",
+    )
+    await config.metadata.create_session(record)
+    config.metrics.record_session_event(model_id, "created")
+
+    init_payload = {
+        "base_model": effective_base_model,
+        "rank": None,
+        "lora_alpha": 0,
+        "target_modules": [],
+        "use_rslora": False,
+        "init_lora_weights": "default",
+        "lora_dropout": 0.0,
+    }
+    pre_op_ctx = await run_pre_op_hooks(config, record, user, "init_session", init_payload)
+    init_job = await _enqueue_job(
+        config=config,
+        session_id=model_id,
+        user_id=user.user_id,
+        operation="init_session",
+        payload=init_payload,
+        priority=10,
+        required_model=effective_base_model,
+    )
+    init_timeout = float(os.environ.get("HATCHERY_CREATE_MODEL_TIMEOUT", "600"))
+    init_result = await config.queue.wait_for_result(init_job.job_id, timeout=init_timeout)
+    await run_post_op_hooks(config, pre_op_ctx, record, user, init_result)
+    if init_result.status != JobStatus.COMPLETED:
+        await config.metadata.update_session(model_id, status=SessionStatus.FAILED)
+        raise HTTPException(500, f"Sampler init failed: {init_result.error}")
+
+    if checkpoint_prefix is not None:
+        # tinker:// path: layer the saved weights on top of the freshly
+        # initialized base. Uses the same worker op /load_weights
+        # enqueues — same payload shape (``checkpoint_prefix`` +
+        # ``restore_optimizer``), no new worker code path.
+        load_payload = {
+            "checkpoint_prefix": checkpoint_prefix,
+            "restore_optimizer": False,
+        }
+        load_job = await _enqueue_job(
+            config=config,
+            session_id=model_id,
+            user_id=user.user_id,
+            operation="load_weights",
+            payload=load_payload,
+            priority=10,
+            required_model=effective_base_model,
+        )
+        load_result = await config.queue.wait_for_result(load_job.job_id, timeout=init_timeout)
+        if load_result.status != JobStatus.COMPLETED:
+            await config.metadata.update_session(model_id, status=SessionStatus.FAILED)
+            raise HTTPException(500, f"Sampler load_weights failed: {load_result.error}")
+
+    ttl = req.ttl_seconds if req.ttl_seconds is not None else 3600
+    expires_at = time.time() + ttl
+    # Use the same wire format save_weights_for_sampler emits so
+    # /asample's existing sampling_session_id decoder (the
+    # ``samp-{model_id}-{seq}-{hash}`` split at tinker_compat.py:~1455)
+    # routes back to this session without further changes. When the
+    # caller supplies a sampling_session_seq_id (tinker SDK does), thread
+    # it into the encoded id so the round-tripped id is stable across
+    # retries — matches save_weights_for_sampler's idempotency pattern.
+    encoded_seq = req.sampling_session_seq_id if req.sampling_session_seq_id is not None else 0
+    sampling_session_id = f"samp-{model_id}-{encoded_seq}-{uuid.uuid4().hex[:8]}"
+
+    inline = {
+        # Tinker's CreateSamplingSessionResponse requires only
+        # ``type`` + ``sampling_session_id``; everything else is a
+        # Hatchery-side extension that the official SDK ignores.
+        "type": "create_sampling_session",
+        "sampling_session_id": sampling_session_id,
+        "model_id": model_id,
+        "base_model": effective_base_model,
+        "session_id": req.session_id,
+        "sampling_session_seq_id": req.sampling_session_seq_id,
+        "expires_at": expires_at,
+    }
+    return _future_response(
+        job_id=f"inline-{model_id}",
+        user_id=user.user_id,
+        operation="create_sampling_session",
+        model_id=model_id,
+        inline_result=inline,
+    )
 
 
 @router.post("/forward_backward")
