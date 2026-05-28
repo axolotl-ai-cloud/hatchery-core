@@ -11,6 +11,7 @@ import contextlib
 
 import httpx
 import msgpack
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
@@ -85,9 +86,21 @@ def _canned(op, payload):
     if op == "optim_step":
         return {"status": "ok", "step": 1, "learning_rate": payload.get("learning_rate")}
     if op == "sample":
-        return {"sequences": [[10, 11, 12]], "texts": ["abc"]}
+        resp = {"sequences": [[10, 11, 12]], "texts": ["abc"]}
+        # Mirror the real worker's prompt_logprobs response shape when
+        # the request asked for them — tinker's compute_logprobs is
+        # implemented as a degenerate sample with this flag set, so
+        # parity tests assert against it.
+        if payload.get("include_prompt_logprobs"):
+            prompt_len = len(payload.get("prompt_tokens", []))
+            resp["prompt_logprobs"] = [None] + [
+                -0.1 * (i + 1) for i in range(max(prompt_len - 1, 0))
+            ]
+        return resp
     if op == "compute_logprobs":
         return {"logprobs": [[-0.1, -0.2, -0.3]]}
+    if op == "forward_logprobs":
+        return {"per_datum_logprobs": [[0.0, -0.5, -0.4, -0.3]]}
     if op == "save_weights":
         return {"path": f"tinker://model/checkpoints/{payload.get('name', 'ckpt')}"}
     return {}
@@ -594,6 +607,282 @@ async def test_save_weights_for_sampler_session_mode(compat_client):
 
 
 # checkpoint_archive, publish, unpublish, ttl routes are in hatchery-hosted
+
+
+# ── create_sampling_session (Tinker create_sampling_client parity) ──────
+
+
+async def test_create_sampling_session_base_model(compat_client):
+    """``create_sampling_session(base_model=...)`` spins up an FFT-shaped
+    session and returns a ``sampling_session_id`` whose encoded model_id
+    round-trips through the existing ``/asample`` decoder.
+    """
+    client, worker = compat_client
+    resp = await client.post(
+        "/api/v1/create_sampling_session",
+        json={"base_model": "Qwen/Qwen2-0.5B"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "request_id" in body
+    assert body["model_id"].startswith("smp_")
+
+    retr = await client.post("/api/v1/retrieve_future", json={"request_id": body["request_id"]})
+    inline = retr.json()
+    assert inline["type"] == "create_sampling_session"
+    assert inline["base_model"] == "Qwen/Qwen2-0.5B"
+    assert inline["model_id"] == body["model_id"]
+    assert inline["sampling_session_id"].startswith(f"samp-{body['model_id']}-0-")
+    assert inline["expires_at"] > 0
+
+    # The worker saw an FFT init (rank=None, no LoRA target_modules) —
+    # confirming we reused the existing _handle_init_session FFT branch
+    # rather than minting a separate handler.
+    init_payload = worker.last_payload_by_op.get("init_session")
+    assert init_payload is not None
+    assert init_payload["rank"] is None
+    assert init_payload["target_modules"] == []
+    assert init_payload["base_model"] == "Qwen/Qwen2-0.5B"
+
+    # /asample's existing sampling_session_id decoder routes the
+    # encoded id back to the same model_id.
+    sid = inline["sampling_session_id"]
+    parts = sid.split("-")
+    decoded_model_id = "-".join(parts[1:-2])
+    assert decoded_model_id == body["model_id"]
+
+
+async def test_create_sampling_session_requires_base_model_or_path(compat_client):
+    """The Pydantic validator must reject requests with neither field set,
+    matching Tinker's ``ValueError("Either model_path or base_model must be provided")``.
+    """
+    client, _ = compat_client
+    resp = await client.post("/api/v1/create_sampling_session", json={})
+    # Pydantic surfaces model-validator failures as 422 via FastAPI.
+    assert resp.status_code == 422, resp.text
+
+
+async def test_resolve_sampler_model_path_tinker_uri(platform_config):
+    """``_resolve_sampler_model_path`` decodes ``tinker://`` URIs to the
+    parent session's base_model + the materialized checkpoint prefix.
+    Direct helper unit test — keeps the parent-session bootstrap out of
+    the HTTP path so the assertion is on the resolver alone.
+    """
+    from hatchery.core.protocols import AuthenticatedUser, SessionRecord, SessionStatus
+    from hatchery.core.tinker_compat import _resolve_sampler_model_path
+
+    parent_record = SessionRecord(
+        session_id="mdl_parent",
+        user_id="u-1",
+        base_model="Qwen/Qwen2-0.5B",
+        lora_rank=8,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        total_steps=0,
+        accum_steps=0,
+        created_at=0.0,
+        last_accessed=0.0,
+        status=SessionStatus.ACTIVE,
+        state_prefix="sessions/mdl_parent/live_state",
+    )
+    await platform_config.metadata.create_session(parent_record)
+    user = AuthenticatedUser(user_id="u-1")
+
+    base_model, prefix = await _resolve_sampler_model_path(
+        platform_config, "tinker://mdl_parent/checkpoints/step-1", user
+    )
+    assert base_model == "Qwen/Qwen2-0.5B"
+    assert prefix == f"{platform_config.sessions_prefix}/mdl_parent/checkpoints/step-1"
+
+    # Local FS / HF id passthrough.
+    base_model, prefix = await _resolve_sampler_model_path(
+        platform_config, "/local/merged/checkpoint", user
+    )
+    assert base_model == "/local/merged/checkpoint"
+    assert prefix is None
+
+    # Cross-user access is denied.
+    other_user = AuthenticatedUser(user_id="u-2")
+    with pytest.raises(Exception) as exc_info:
+        await _resolve_sampler_model_path(
+            platform_config, "tinker://mdl_parent/checkpoints/step-1", other_user
+        )
+    # FastAPI HTTPException is what the resolver raises.
+    assert "403" in str(exc_info.value) or "different user" in str(exc_info.value)
+
+
+# ── Tinker wire-shape parity ────────────────────────────────────────────
+#
+# These tests POST the exact JSON the official ``tinker`` SDK emits
+# (schema source: ``tinker/types/*_request.py`` in ``tinker==0.22.2``)
+# and assert the response decodes against tinker's response types. They
+# guarantee that a user running ``pip install tinker`` and pointing at
+# our gateway gets the right behavior for the three Tinker-API parity
+# items, without taking a runtime dependency on the tinker SDK.
+
+
+async def test_tinker_wire_shape_create_sampling_session(compat_client):
+    """The official ``tinker.types.CreateSamplingSessionRequest`` has
+    REQUIRED fields ``session_id`` and ``sampling_session_seq_id`` plus
+    optional ``base_model`` / ``model_path``. Our route must accept that
+    exact body and return a response whose required fields match
+    ``tinker.types.CreateSamplingSessionResponse``
+    (``type`` + ``sampling_session_id``).
+    """
+    client, _ = compat_client
+    # Verbatim tinker-shape body — every field tinker's pydantic model
+    # marks required, populated as tinker would populate them.
+    body = {
+        "session_id": "tinker-session-abc",
+        "sampling_session_seq_id": 0,
+        "base_model": "Qwen/Qwen2-0.5B",
+        "model_path": None,
+        "type": "create_sampling_session",
+    }
+    resp = await client.post("/api/v1/create_sampling_session", json=body)
+    assert resp.status_code == 200, resp.text
+    request_id = resp.json()["request_id"]
+
+    retr = await client.post("/api/v1/retrieve_future", json={"request_id": request_id})
+    inline = retr.json()
+    # CreateSamplingSessionResponse required fields (tinker schema):
+    assert inline["type"] == "create_sampling_session"
+    assert isinstance(inline["sampling_session_id"], str)
+    assert inline["sampling_session_id"].startswith("samp-")
+    # The supplied sampling_session_seq_id is embedded in the encoded id
+    # so tinker's idempotent-retry path round-trips stably.
+    assert "-0-" in inline["sampling_session_id"]
+
+
+async def test_tinker_wire_shape_sample_with_prompt_logprobs(compat_client):
+    """Tinker's ``SamplingClient.compute_logprobs`` issues a degenerate
+    sample with ``prompt_logprobs=True`` and ``max_tokens=1``
+    (``tinker/lib/public_interfaces/sampling_client.py:399-406``). The
+    on-wire schema is ``tinker.types.SampleRequest``, which has the
+    wire-level field name ``prompt_logprobs`` (the Python kwarg
+    ``include_prompt_logprobs`` is translated at the SDK boundary).
+
+    Our /asample must accept that wire field and return
+    ``prompt_logprobs`` in the response — that's the whole reason
+    tinker's compute_logprobs works against us with zero SDK changes.
+    """
+    client, _ = compat_client
+    # First mint a sampling session via the tinker-shape route.
+    create_body = {
+        "session_id": "tinker-sess-xyz",
+        "sampling_session_seq_id": 0,
+        "base_model": "Qwen/Qwen2-0.5B",
+        "model_path": None,
+        "type": "create_sampling_session",
+    }
+    cs_resp = await client.post("/api/v1/create_sampling_session", json=create_body)
+    cs_inline = (
+        await client.post(
+            "/api/v1/retrieve_future", json={"request_id": cs_resp.json()["request_id"]}
+        )
+    ).json()
+    sampling_session_id = cs_inline["sampling_session_id"]
+
+    # Verbatim tinker SampleRequest shape (sample_request.py:13-55).
+    sample_body = {
+        "sampling_session_id": sampling_session_id,
+        "num_samples": 1,
+        "prompt": {
+            "chunks": [{"type": "encoded_text", "tokens": [10, 20, 30, 40, 50]}],
+        },
+        "sampling_params": {
+            "max_tokens": 1,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+        },
+        "prompt_logprobs": True,  # the wire-level field name
+        "topk_prompt_logprobs": 0,
+    }
+    s_resp = await client.post("/api/v1/asample", json=sample_body)
+    assert s_resp.status_code == 200, s_resp.text
+    s_inline = (
+        await client.post(
+            "/api/v1/retrieve_future", json={"request_id": s_resp.json()["request_id"]}
+        )
+    ).json()
+
+    # The compute_logprobs trick depends on this exact response shape:
+    # [None] + len(prompt)-1 floats. Tinker drops [0] and uses the rest.
+    assert "prompt_logprobs" in s_inline, s_inline
+    lps = s_inline["prompt_logprobs"]
+    assert lps[0] is None
+    assert all(isinstance(x, float) for x in lps[1:])
+    assert len(lps) == 5  # matches prompt length
+
+
+async def test_tinker_wire_shape_forward_returns_per_datum_logprobs(compat_client):
+    """``tinker.TrainingClient.forward`` posts ``ForwardRequest``
+    (``forward_input`` + ``model_id`` + ``seq_id``) to ``/api/v1/forward``
+    and expects the gateway to enqueue the per-position-logprobs op.
+
+    The future result must contain ``per_datum_logprobs`` — the
+    field name tinker's response decoder expects. Hatchery's existing
+    /forward route + worker forward_logprobs op deliver this; this test
+    pins the contract so a future refactor can't silently change it.
+    """
+    client, _ = compat_client
+    mid = (
+        await client.post(
+            "/api/v1/create_model",
+            json={
+                "session_id": "s",
+                "model_seq_id": 0,
+                "base_model": "Qwen/Qwen2-0.5B",
+                "lora_config": {"rank": 8},
+            },
+        )
+    ).json()["model_id"]
+
+    # Verbatim tinker ForwardRequest shape.
+    fwd_body = {
+        "forward_input": {
+            "data": [
+                {
+                    "model_input": {
+                        "chunks": [
+                            {"type": "encoded_text", "tokens": [1, 2, 3, 4]},
+                        ],
+                    },
+                    "loss_fn_inputs": {
+                        "target_tokens": {"data": [1, 2, 3, 4], "shape": [4]},
+                    },
+                }
+            ],
+            "loss_fn": "cross_entropy",
+        },
+        "model_id": mid,
+        "seq_id": 1,
+    }
+    f_resp = await client.post("/api/v1/forward", json=fwd_body)
+    assert f_resp.status_code == 200, f_resp.text
+    f_inline = (
+        await client.post(
+            "/api/v1/retrieve_future", json={"request_id": f_resp.json()["request_id"]}
+        )
+    ).json()
+
+    # Tinker's ForwardBackwardOutput shape (see
+    # tinker/types/forward_backward_output.py): loss_fn_output_type +
+    # loss_fn_outputs (list of {logprobs: TensorData}) + metrics. The
+    # gateway's _wrap_future_result (tinker_compat.py:~2349) transforms
+    # the worker's per_datum_logprobs into exactly this envelope.
+    assert f_inline["loss_fn_output_type"] == "cross_entropy"
+    assert isinstance(f_inline["loss_fn_outputs"], list)
+    assert len(f_inline["loss_fn_outputs"]) >= 1
+    first = f_inline["loss_fn_outputs"][0]
+    assert "logprobs" in first
+    td = first["logprobs"]
+    # TensorData wire shape: {data, dtype, shape}.
+    assert "data" in td
+    assert "dtype" in td
+    assert "shape" in td
+    assert isinstance(td["data"], list)
 
 
 # ── SSRF protection ─────────────────────────────────────────────────────
