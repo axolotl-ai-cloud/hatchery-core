@@ -30,7 +30,39 @@ class ParallelExtension:
     cleanup_runtime: Optional[Callable[[Any], None]] = None
 
 
+@dataclass
+class DistributedHelpers:
+    """Torch-distributed helpers an extension exposes to core.
+
+    Core owns single-process and DP-only FSDP2 execution and does not
+    depend on torch.distributed directly. An extension package registers
+    the concrete helpers here on import so core code can reach
+    process-group init, device-mesh construction, and context-parallel
+    regions without importing — or even naming — the extension package.
+
+    All fields are callables; ``get_cp_mesh`` and ``context_parallel_region``
+    are optional and may be ``None`` for DP-only deployments.
+    """
+
+    init_distributed_if_needed: Callable[[Any], None]
+    build_device_mesh: Callable[[Any], Any]
+    get_cp_mesh: Optional[Callable[[Any, Any], Any]] = None
+    context_parallel_region: Optional[Callable[..., Any]] = None
+
+
 _EXTENSIONS: list[ParallelExtension] = []
+_DISTRIBUTED_HELPERS: Optional[DistributedHelpers] = None
+
+
+def register_distributed_helpers(helpers: DistributedHelpers) -> None:
+    """Register the torch-distributed helper bundle. Last registration wins."""
+    global _DISTRIBUTED_HELPERS
+    _DISTRIBUTED_HELPERS = helpers
+
+
+def get_distributed_helpers() -> Optional[DistributedHelpers]:
+    """Return the registered distributed helpers, or ``None`` if unset."""
+    return _DISTRIBUTED_HELPERS
 
 
 def register_parallel_extension(extension: ParallelExtension) -> None:
@@ -68,4 +100,6 @@ def select_parallel_extension(config: Any) -> Optional[ParallelExtension]:
 
 def _reset_parallel_hooks_for_tests() -> None:
     """Clear module-level registries for isolated unit tests."""
+    global _DISTRIBUTED_HELPERS
     _EXTENSIONS.clear()
+    _DISTRIBUTED_HELPERS = None
