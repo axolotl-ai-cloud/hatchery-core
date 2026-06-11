@@ -30,6 +30,31 @@ export HATCHERY_DEV_API_KEY=hatchery_change_me
 python -m hatchery.core.local_dev
 ```
 
+## Venvstacks Packaging
+
+Hatchery Core also includes a
+[`venvstacks`](https://venvstacks.lmstudio.ai/overview/) definition under
+`packaging/venvstacks/`. `venvstacks` packages Python applications as layered
+virtual environments and uses `uv` for dependency locking and installation.
+
+Build a local Hatchery wheel first when packaging the current checkout:
+
+```bash
+python -m build --wheel --outdir packaging/venvstacks/wheelhouse
+uvx --from venvstacks venvstacks show packaging/venvstacks/venvstacks.toml
+uvx --from venvstacks venvstacks lock \
+  --local-wheels wheelhouse \
+  packaging/venvstacks/venvstacks.toml
+uvx --from venvstacks venvstacks build \
+  --local-wheels wheelhouse \
+  --include-dependencies \
+  packaging/venvstacks/venvstacks.toml
+```
+
+The stack defines app layers for local dev, gateway, and worker entry points.
+Published Hatchery releases can omit `--local-wheels` and resolve
+`hatchery-core` from the configured package indexes.
+
 ## Separate Gateway And Worker
 
 Do this only when gateway and worker share durable metadata and queue
