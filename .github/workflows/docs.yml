@@ -1,0 +1,42 @@
+name: Docs Site
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "content/docs/**"
+      - "docs-site/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    paths:
+      - "content/docs/**"
+      - "docs-site/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Install dependencies
+        working-directory: docs-site
+        run: npm ci
+
+      - name: Build static site
+        working-directory: docs-site
+        run: npm run build
+
+      - name: Check static output exists
+        working-directory: docs-site
+        run: test -f out/index.html && test -f out/docs/getting-started/quickstart.html

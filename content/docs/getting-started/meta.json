@@ -3,6 +3,7 @@
   "defaultOpen": true,
   "pages": [
     "quickstart",
+    "tinker-migration",
     "self-hosting",
     "deployment"
   ]

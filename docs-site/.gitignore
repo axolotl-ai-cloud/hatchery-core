@@ -1,0 +1,15 @@
+# deps
+/node_modules
+/.scratch-dev
+
+# generated content
+.source
+
+# build output
+/.next/
+/out/
+*.tsbuildinfo
+next-env.d.ts
+
+# misc
+.DS_Store
