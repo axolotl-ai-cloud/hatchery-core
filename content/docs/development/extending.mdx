@@ -143,6 +143,52 @@ Guidelines:
 - ensure ownership and quota checks match native routes
 - ensure pre/post hooks run for metered operations
 
+## Operator Loss Plugins
+
+Loss functions dispatch by name through a registry in `hatchery/core/losses.py`.
+Core ships built-ins (`cross_entropy`, `importance_sampling`, `ppo`, `cispo`,
+`grpo`, `dapo`, `gspo`, `orpo`); an operator can add more without forking core.
+
+Contract:
+
+- register with `register_loss(name, fn, override=False)`
+- `fn` has signature `fn(inputs: LossInputs) -> Tensor | tuple[Tensor, dict]`
+- `name` must be a valid Python identifier
+- built-ins can only be replaced if you pass `override=True`; a non-built-in
+  name can be re-registered by a later call regardless of `override`
+- plugins are discovered lazily, once per process, from the `hatchery.losses`
+  entry-point group; a plugin whose `ep.load()` raises is logged and skipped,
+  not fatal to the worker
+- `get_server_capabilities` advertises `supported_loss_fns()` (live registry)
+  and `declared_loss_fns()` (registry plus declared-but-unimplemented `dro`) —
+  prefer these over the static `SUPPORTED_LOSS_FNS` tuple, which does not
+  include plugin-registered names
+
+Register via entry point, in your plugin package's `pyproject.toml`:
+
+```toml
+[project.entry-points."hatchery.losses"]
+my_dpo = "my_pkg.losses:my_dpo"
+```
+
+Or register directly, e.g. from a config factory or test setup:
+
+```python
+from hatchery.core.losses import register_loss
+
+
+def my_dpo(inputs):
+    ...  # return Tensor | tuple[Tensor, dict]
+
+
+register_loss("my_dpo", my_dpo)
+```
+
+This is an operator-install-only surface, not a tenant upload path: there is
+no gRPC/HTTP registration endpoint and no sandboxing. Registered callables
+run inside the worker training process with full Python privileges — install
+only trusted packages.
+
 ## Open Core Boundary
 
 Core extension points should remain vendor-neutral.
