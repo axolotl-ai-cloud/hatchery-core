@@ -118,7 +118,7 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
 
     app = FastAPI(
         title="Tinker-Compatible Training Platform",
-        version="0.1.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
     # Order matters: inner-most is added first. Request flow on the wire
