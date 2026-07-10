@@ -44,7 +44,7 @@ docs-site/
 Content itself lives in `../content/docs` and is untouched by this
 directory except where a page didn't exist yet (see
 `../content/docs/getting-started/tinker-migration.mdx`,
-`../content/docs/cookbook.mdx`, `../content/docs/pricing.mdx`, added to fill
+`../content/docs/cookbook/`, `../content/docs/pricing.mdx`, added to fill
 out the required nav) or where `meta.json`/`docs.json` ordering was updated
 to surface Quickstart and the Tinker migration guide first.
 

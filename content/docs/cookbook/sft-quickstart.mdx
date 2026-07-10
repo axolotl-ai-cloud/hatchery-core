@@ -1,0 +1,202 @@
+---
+title: "SFT Quickstart: LoRA Fine-Tune On Alpaca"
+description: LoRA fine-tune Qwen/Qwen2-0.5B-Instruct on a slice of Stanford Alpaca via the hatchery-client SDK against a local gateway.
+---
+
+## Goal
+
+Fine-tune a LoRA adapter on top of `Qwen/Qwen2-0.5B-Instruct` using a small
+slice of the public [Stanford Alpaca](https://huggingface.co/datasets/tatsu-lab/alpaca)
+instruction dataset, entirely through the `hatchery-client` SDK against a
+locally running gateway. This is the canonical first run: create a session,
+loop `forward_backward` + `optim_step`, save a checkpoint, sample from it.
+
+## Setup
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e '.[test,examples]'
+```
+
+Start the local gateway with a real (non-scripted) worker loaded on the
+instruct model:
+
+```bash
+HATCHERY_DEV_BASE_MODEL=Qwen/Qwen2-0.5B-Instruct python -m hatchery.core.local_dev
+```
+
+This auto-detects CUDA and loads a real GPU worker. On a CPU-only machine it
+falls back to the scripted worker instead (deterministic fake results) — see
+[Common Failures](#common-failures) below for how to tell which one you got.
+
+## Script
+
+Save as `sft_quickstart.py` and run with `python sft_quickstart.py`:
+
+```python
+"""LoRA fine-tune Qwen/Qwen2-0.5B-Instruct on a slice of Stanford Alpaca."""
+
+import os
+
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+from hatchery.client import HatcheryClient
+
+BASE_URL = os.environ.get("HATCHERY_BASE_URL", "http://127.0.0.1:8420")
+TOKEN = os.environ.get("HATCHERY_API_KEY", "dev")
+BASE_MODEL = "Qwen/Qwen2-0.5B-Instruct"
+
+N_EXAMPLES = 32
+BATCH_SIZE = 8
+EPOCHS = 3
+LR = 1e-4
+
+
+def build_example(tok, row: dict) -> dict:
+    user_msg = row["instruction"]
+    if row["input"]:
+        user_msg += "\n\n" + row["input"]
+    # `return_dict=False` matters here: with the default `return_dict=True`,
+    # `apply_chat_template(..., tokenize=True)` returns a `BatchEncoding`
+    # (a dict with `input_ids`/`attention_mask` keys) rather than a plain
+    # token list, and `len(...)` on that dict silently returns 2 (the key
+    # count) instead of the sequence length.
+    prompt_ids = tok.apply_chat_template(
+        [{"role": "user", "content": user_msg}],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+    )
+    full_ids = tok.apply_chat_template(
+        [
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": row["output"]},
+        ],
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=False,
+    )
+    # Tinker convention: model_input is right-shifted, target_tokens
+    # left-shifted. Prompt tokens are masked out of the loss with -100.
+    input_ids = full_ids[:-1]
+    labels = [-100] * (len(prompt_ids) - 1) + full_ids[len(prompt_ids) :]
+    return {
+        "model_input": {"chunks": [{"type": "encoded_text", "tokens": input_ids}]},
+        "loss_fn_inputs": {"target_tokens": {"data": labels, "shape": [len(labels)]}},
+    }
+
+
+def main() -> None:
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+
+    dataset = load_dataset("tatsu-lab/alpaca", split=f"train[:{N_EXAMPLES}]")
+    examples = [build_example(tok, row) for row in dataset]
+    print(f"loaded {len(examples)} alpaca examples")
+
+    client = HatcheryClient(base_url=BASE_URL, token=TOKEN)
+    tc = client.create_lora_training_client(BASE_MODEL, rank=8)
+    print(f"session: {tc.model_id}")
+
+    n_batches = (len(examples) + BATCH_SIZE - 1) // BATCH_SIZE
+    step = 0
+    for epoch in range(EPOCHS):
+        for b in range(n_batches):
+            batch = examples[b * BATCH_SIZE : (b + 1) * BATCH_SIZE]
+            fb = tc.forward_backward(batch).result(timeout=60)
+            tc.optim_step(learning_rate=LR).result(timeout=30)
+            step += 1
+            loss = fb["metrics"].get("loss:mean", fb.get("loss"))
+            print(f"step {step:>2}/{n_batches * EPOCHS}  loss={loss:.4f}")
+
+    ckpt = tc.save_weights("alpaca-lora").result(timeout=30)
+    print(f"checkpoint: {ckpt['path']}")
+
+    prompt = "What are three tips for staying focused while studying?"
+    prompt_ids = tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+    )
+    sample = tc.sample(prompt_ids, max_tokens=60, temperature=0.0).result(timeout=30)
+    gen_ids = sample["sequences"][0]["tokens"]
+    print(f"\nprompt: {prompt}")
+    print("completion:", tok.decode(gen_ids, skip_special_tokens=True).strip())
+
+    client.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Expected Output
+
+```text
+loaded 32 alpaca examples
+session: mdl_2794be29499d42c1953796b22039e164
+step  1/12  loss=1.5997
+step  2/12  loss=1.5338
+step  3/12  loss=1.6458
+step  4/12  loss=1.5065
+step  5/12  loss=1.4245
+step  6/12  loss=1.3816
+step  7/12  loss=1.5688
+step  8/12  loss=1.4235
+step  9/12  loss=1.3018
+step 10/12  loss=1.2394
+step 11/12  loss=1.4846
+step 12/12  loss=1.3409
+checkpoint: tinker://mdl_2794be29499d42c1953796b22039e164/checkpoints/alpaca-lora
+
+prompt: What are three tips for staying focused while studying?
+completion: 1. Set specific goals and deadlines for each study session.
+2. Use the Pomodoro Technique, which involves working in 25-minute intervals followed by a 5-minute break.
+3. Avoid distractions during your studies to maintain focus.
+```
+
+Loss is noisy step to step (only 8 examples per batch, 3 epochs over the
+same 32 examples) but trends down. `session`/checkpoint IDs are random per
+run — everything else should reproduce closely.
+
+## Cost / Time
+
+Ran end-to-end (dataset load + 12 training steps + checkpoint + sample) in
+**~16 seconds** on a single idle RTX PRO 6000 (rank-8 LoRA, batch size 8,
+`Qwen/Qwen2-0.5B-Instruct` already cached locally). Model + dataset download
+on a cold Hugging Face cache adds roughly another 10-30 seconds depending on
+bandwidth. This is intentionally a smoke-sized run — scale `N_EXAMPLES`,
+`BATCH_SIZE`, and `EPOCHS` up for a real fine-tune.
+
+## Common Failures
+
+- **`BatchEncoding` mistaken for a token list.** `tokenizer.apply_chat_template(...,
+  tokenize=True)` defaults to `return_dict=True` in recent `transformers`
+  versions, returning a dict-like `BatchEncoding` instead of a plain list.
+  `len(...)` on it returns `2` (the number of keys), not the sequence
+  length, which then fails deep in the worker's collate step with a
+  confusing `labels length N != input_ids length 0` error. Always pass
+  `return_dict=False` when you intend to get a plain token list back.
+- **`ModuleNotFoundError: No module named 'datasets'`.** The `datasets`
+  dependency lives behind the `examples` extra
+  (`uv pip install -e '.[examples]'` or `uv run --extra examples ...`), not
+  the base install.
+- **Connection refused.** The gateway isn't running yet, or you're pointed
+  at the wrong port — confirm with `curl http://127.0.0.1:8420/v1/health`
+  before running the script.
+- **Scripted-worker output instead of real training.** On a CPU-only
+  machine, `local_dev` silently falls back to a scripted worker that
+  returns deterministic fake losses/samples. Check the gateway's startup
+  banner for `Worker: GPU worker on cuda:0 (...)` vs `Worker: scripted
+  worker (no GPU)` before trusting the loss curve.
+
+## Next Steps
+
+- [Custom Loss](custom-loss): implement a loss the built-in `loss_fn`
+  values can't express, via `forward_backward_custom_step1`/`step2`.
+- [RL-Style Loop](rl-loop): sample, score, and optimize with GRPO.
+- [Save/Resume + Sampling](save-resume): checkpoint mid-training and resume
+  in a fresh session.
+- [API endpoints](../reference/endpoints): the full route reference.
