@@ -220,11 +220,17 @@ Core runtime variables:
 ## Documentation
 
 - [Quickstart](content/docs/getting-started/quickstart.mdx): local gateway, worker, and client workflow.
+- [Migrating From Tinker](content/docs/getting-started/tinker-migration.mdx): point the official Tinker SDK (or `hatchery-client`) at a Hatchery gateway.
 - [Self-hosting](content/docs/getting-started/self-hosting.mdx): running core outside the local dev launcher.
 - [Architecture](content/docs/learn/architecture.mdx): control plane, worker, queue, and storage flow.
 - [API endpoints](content/docs/reference/endpoints.mdx): native and Tinker-compatible routes.
+- [Cookbook](content/docs/cookbook.mdx): worked SFT and style-transfer training examples.
 - [Testing](content/docs/development/testing.mdx): CPU, GPU, lint, and packaging checks.
 - [Extending Hatchery Core](content/docs/development/extending.mdx): backend and extension contracts.
+
+These pages render as a browsable site via [`docs-site/`](docs-site/README.md) (Fumadocs); run
+`cd docs-site && npm install && npm run dev` for local preview or `npm run build` for a static
+export.
 
 For enterprise or self-hosted deployment questions, or if you need help adapting Hatchery to a sensitive workflow, contact `contact@axolotl.ai`.
 

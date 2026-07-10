@@ -3,8 +3,10 @@
   "pages": [
     "index",
     "getting-started",
-    "learn",
     "reference",
+    "cookbook",
+    "pricing",
+    "learn",
     "development"
   ]
 }

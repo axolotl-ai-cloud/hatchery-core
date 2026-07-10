@@ -1,0 +1,129 @@
+---
+title: Migrating From Tinker
+description: Point the official Tinker SDK (or Hatchery's own client) at a Hatchery gateway.
+---
+
+Hatchery's gateway mounts a Tinker-compatible API at `/api/v1/*` that mirrors the
+public [Tinker SDK](https://pypi.org/project/tinker/) wire protocol (futures-based
+`create_session` / `create_model` / `forward_backward` / `optim_step` / `sample` /
+`save_weights` / `retrieve_future`). Moving a training script from Tinker to a
+Hatchery gateway is a matter of changing where the client points, not what it sends.
+
+## 1. Install
+
+You have two options; both speak the same wire protocol.
+
+**Keep the official Tinker SDK.** No code changes beyond the client construction:
+
+```bash
+pip install tinker
+```
+
+```python
+import tinker
+
+client = tinker.ServiceClient(api_key="<your-key>", base_url="https://gateway.hatchery.ai")
+training = client.create_lora_training_client(base_model="Qwen/Qwen2-0.5B")
+```
+
+**Switch to `hatchery-client`.** A thinner, dependency-light client with the same
+response shapes, so scripts written against the Tinker SDK "lift straight over by
+swapping the client import":
+
+```bash
+pip install hatchery-client
+```
+
+```python
+from hatchery.client import HatcheryClient
+
+client = HatcheryClient(base_url="https://gateway.hatchery.ai", token="<your-key>")
+training = client.create_lora_training_client("Qwen/Qwen2-0.5B", rank=32)
+```
+
+`hatchery-client` is also importable as `hatchery.core.client` for backward
+compatibility if you're already depending on `hatchery-core` directly.
+
+<Callout type="warn">
+`https://gateway.hatchery.ai` above is a placeholder. Use the base URL and API key
+from your Hatchery account; for a self-hosted open-core deployment, use the URL of
+your own gateway instead (see [Self-hosting](self-hosting)).
+</Callout>
+
+## 2. Point `base_url` At The Gateway
+
+- Official SDK: pass `base_url=` to `tinker.ServiceClient(...)`, or set the
+  `TINKER_API_URL` environment variable — Hatchery's gateway is a drop-in target for
+  either.
+- `hatchery-client`: pass `base_url=` and `token=` to `HatcheryClient(...)` directly.
+  There is no environment-variable fallback; both are required constructor arguments.
+
+Everything downstream — session creation, training calls, sampling, checkpointing —
+uses the same request/response shapes regardless of which client you use.
+
+## What's Identical
+
+- **Wire protocol.** The same futures envelope (`UntypedAPIFuture`, poll via
+  `retrieve_future`) and the same request/response schemas for
+  `create_session`, `create_model`, `forward_backward`, `forward_only`,
+  `forward`, `optim_step`, `asample`, `save_weights`, `save_state`,
+  `load_weights` (with optional optimizer-state restore), and checkpoint
+  listing.
+- **Auth header shape.** Bearer-token auth (`Authorization: Bearer <token>`), the
+  same header the official SDK sends.
+- **Training modes.** LoRA (`lora_config` with a `rank`) and full-parameter
+  fine-tuning (`lora_config: null`).
+- **Loss functions.** `cross_entropy`, `importance_sampling`, `ppo`, `cispo`,
+  `grpo`, `dapo`, `gspo`, and `orpo` are implemented and advertised through
+  `get_server_capabilities`. Custom two-step losses
+  (`forward_backward_custom_step1`/`step2`) are supported.
+  `dro` is a declared Tinker loss type without a public formulation; Hatchery
+  lists it as declared-but-unimplemented and raises if you invoke it, matching
+  upstream Tinker's own status for that loss.
+- **Sampling.** `asample`, dedicated sampler-only sessions via
+  `create_sampling_session` / `create_sampling_client` (mirrors
+  `ServiceClient.create_sampling_client`), and prompt/topk logprobs.
+- **Data shapes.** `ModelInput` chunk lists (`encoded_text`, plus image chunks —
+  see below), dense and sparse (`TensorData`) tensor encodings, and the
+  Tinker convention of right-shifted `model_input` / left-shifted
+  `target_tokens` for causal LM training.
+- **Multi-modal chunks.** Image chunks (`image`, `image_asset_pointer`) are
+  accepted and decoded on the wire the same way the SDK sends them, though
+  Hatchery's release validation is still primarily text-only — treat VLM
+  training paths as less battle-tested than text.
+
+## What Differs
+
+- **Model catalog.** Tinker's hosted service offers a curated base-model
+  catalog. Hatchery gateways (hosted or self-hosted) run whatever Hugging Face
+  model id the worker is configured for or given at `create_model` time — a
+  wider surface, but you're responsible for whether the model fits your
+  worker's GPU.
+- **Client construction.** `hatchery-client`'s `HatcheryClient` takes
+  `token=` (not `api_key=`) and requires `base_url=` explicitly — there's no
+  `TINKER_API_URL`/`TINKER_API_KEY` environment-variable fallback the way the
+  official SDK supports. If you want env-var-driven configuration, keep using
+  the official `tinker` SDK against your Hatchery gateway.
+- **Billing and quotas.** A self-hosted open-core gateway does not meter or
+  bill usage — that's extension/hosted-platform behavior layered on top of
+  the same routes via pre/post-operation hooks. A hosted Hatchery gateway may
+  enforce prepaid balance or quota checks before a job is enqueued; consult
+  your hosted account's billing documentation for specifics.
+- **Auth backend.** Open-core ships simple API-key auth. A hosted gateway may
+  issue and manage keys differently (for example through SSO-backed account
+  management) even though the bearer-token wire shape you send is unchanged.
+- **Checkpoint lifecycle extras.** TTL sweeping and public checkpoint
+  publishing are hosted/extension features, not part of the open-core
+  `save_weights`/`load_weights`/checkpoint-listing surface.
+- **`list_sessions`.** `hatchery-client`'s `list_sessions()` falls back to
+  Hatchery's native `/v1/sessions` endpoint — there's no Tinker-wire
+  equivalent for it today.
+
+## Next Steps
+
+- [Quickstart](quickstart): run a Hatchery gateway locally and try the wire API
+  end to end.
+- [API endpoints](../reference/endpoints): the full native and Tinker-compatible
+  route reference.
+- [Cookbook](../cookbook): worked SFT and style-transfer examples using either
+  client.

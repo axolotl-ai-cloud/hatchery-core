@@ -13,8 +13,27 @@
         "group": "Getting Started",
         "pages": [
           "content/docs/getting-started/quickstart",
+          "content/docs/getting-started/tinker-migration",
           "content/docs/getting-started/self-hosting",
           "content/docs/getting-started/deployment"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "content/docs/reference/endpoints"
+        ]
+      },
+      {
+        "group": "Cookbook",
+        "pages": [
+          "content/docs/cookbook"
+        ]
+      },
+      {
+        "group": "Pricing",
+        "pages": [
+          "content/docs/pricing"
         ]
       },
       {
@@ -22,12 +41,6 @@
         "pages": [
           "content/docs/learn/architecture",
           "content/docs/learn/open-core"
-        ]
-      },
-      {
-        "group": "Reference",
-        "pages": [
-          "content/docs/reference/endpoints"
         ]
       },
       {
