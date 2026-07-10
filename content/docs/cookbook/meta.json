@@ -1,0 +1,9 @@
+{
+  "title": "Cookbook",
+  "pages": [
+    "sft-quickstart",
+    "custom-loss",
+    "rl-loop",
+    "save-resume"
+  ]
+}

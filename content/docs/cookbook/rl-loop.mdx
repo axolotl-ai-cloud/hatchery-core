@@ -1,0 +1,203 @@
+---
+title: "RL-Style Loop: A Minimal GRPO Trainer"
+description: Sample completions, score them, compute group-relative advantages, and optimize with the built-in grpo loss.
+---
+
+## Goal
+
+Run a minimal GRPO-flavored RL loop against the API: sample several
+completions per prompt, score them with a reward function you write,
+compute group-relative advantages, and run one `forward_backward` +
+`optim_step` per RL step using the built-in `grpo` loss.
+
+## What Core Provides vs. What You Write
+
+Hatchery core gives you three primitives and nothing else:
+
+- **Sampling with logprobs** (`training.sample(...)`): generates
+  completions and returns the rollout policy's per-token logprobs alongside
+  the tokens — the `old_logprobs` a policy-gradient loss needs.
+- **The `grpo` loss** (`forward_backward(..., loss_fn="grpo", ...)`):
+  given `target_tokens`, `logprobs` (old policy), and `advantages` per
+  position, computes the clipped surrogate objective plus a KL penalty
+  against the old policy, and backpropagates.
+- **`optim_step`**: applies the accumulated gradient.
+
+Core has **no concept of a task, a reward, or "correctness"**. Everything
+in between — deciding what to sample, writing the reward function, turning
+rewards into advantages (the group-relative normalization that gives GRPO
+its name), and packing rollouts back into the wire format — is yours to
+write. The script below keeps all of that explicit rather than hiding it in
+a helper, since that boundary is the point of the recipe.
+
+## Script
+
+Save as `grpo_loop.py` and run with `python grpo_loop.py` against a running
+gateway (see [SFT Quickstart](sft-quickstart) for how to start one):
+
+```python
+"""Minimal GRPO-style RL loop: sample, score, advantage, forward_backward(grpo)."""
+
+import os
+
+from transformers import AutoTokenizer
+
+from hatchery.client import HatcheryClient
+
+BASE_URL = os.environ.get("HATCHERY_BASE_URL", "http://127.0.0.1:8420")
+TOKEN = os.environ.get("HATCHERY_API_KEY", "dev")
+BASE_MODEL = "Qwen/Qwen2-0.5B-Instruct"
+
+# Prompt -> single-word answer we reward. Everything about *how* a
+# completion earns reward is ours to define; core only runs sampling
+# and the GRPO loss, it has no notion of "correct answer".
+TASK = [
+    ("Reply with one word: the opposite of hot.", "cold"),
+    ("Reply with one word: the opposite of up.", "down"),
+    ("Reply with one word: the opposite of fast.", "slow"),
+    ("Reply with one word: the opposite of day.", "night"),
+]
+N_SAMPLES = 4  # completions per prompt
+RL_STEPS = 6
+KL_BETA = 0.04
+
+
+def reward_fn(completion: str, expected: str) -> float:
+    """User-defined reward -- core has no idea what "correct" means."""
+    first_word = completion.strip().lower().split()[0].strip(".,!") if completion.strip() else ""
+    return 1.0 if first_word == expected else 0.0
+
+
+def main() -> None:
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+    client = HatcheryClient(base_url=BASE_URL, token=TOKEN)
+    tc = client.create_lora_training_client(BASE_MODEL, rank=8)
+    print(f"session: {tc.model_id}")
+
+    for rl_step in range(1, RL_STEPS + 1):
+        batch_data = []
+        batch_rewards = []
+
+        for prompt, expected in TASK:
+            prompt_ids = tok.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
+            )
+
+            # 1. Core provides sampling with logprobs of what was sampled.
+            result = tc.sample(
+                prompt_ids, max_tokens=6, temperature=0.9, n=N_SAMPLES
+            ).result(timeout=30)
+            seqs = result["sequences"]
+
+            # 2. User-defined: decode + score each completion.
+            rewards = []
+            for seq in seqs:
+                text = tok.decode(seq["tokens"], skip_special_tokens=True)
+                rewards.append(reward_fn(text, expected))
+            batch_rewards.extend(rewards)
+
+            # 3. User-defined: group-relative advantage (the "GR" in GRPO).
+            mean_r = sum(rewards) / len(rewards)
+            var_r = sum((r - mean_r) ** 2 for r in rewards) / len(rewards)
+            std_r = max(var_r**0.5, 1e-6)
+            advantages = [(r - mean_r) / std_r for r in rewards]
+
+            # 4. Build one Datum per completion: prompt tokens masked out,
+            # completion tokens carry old_logprobs (from sampling) + advantage.
+            for seq, adv in zip(seqs, advantages):
+                comp_ids = seq["tokens"]
+                comp_lp = seq.get("logprobs") or [0.0] * len(comp_ids)
+                full_ids = list(prompt_ids) + list(comp_ids)
+                input_ids = full_ids[:-1]
+                labels = [-100] * (len(prompt_ids) - 1) + list(comp_ids)
+                old_lp = [0.0] * (len(prompt_ids) - 1) + list(comp_lp)
+                adv_per_tok = [0.0] * (len(prompt_ids) - 1) + [adv] * len(comp_ids)
+                batch_data.append(
+                    {
+                        "model_input": {"chunks": [{"type": "encoded_text", "tokens": input_ids}]},
+                        "loss_fn_inputs": {
+                            "target_tokens": {"data": labels, "shape": [len(labels)]},
+                            "logprobs": {"data": old_lp, "shape": [len(old_lp)]},
+                            "advantages": {"data": adv_per_tok, "shape": [len(adv_per_tok)]},
+                        },
+                    }
+                )
+
+        # 5. Core provides the GRPO loss + optimizer step.
+        fb = tc.forward_backward(
+            batch_data,
+            loss_fn="grpo",
+            loss_fn_config={"kl_beta": KL_BETA, "clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
+        ).result(timeout=60)
+        tc.optim_step(learning_rate=1e-4).result(timeout=30)
+
+        loss = fb["metrics"].get("loss:mean", fb.get("loss"))
+        mean_reward = sum(batch_rewards) / len(batch_rewards)
+        print(f"rl_step {rl_step}/{RL_STEPS}  loss={loss:.4f}  mean_reward={mean_reward:.2f}")
+
+    client.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Expected Output
+
+```text
+session: mdl_f7a5c06c00824893aa84ff27c4521590
+rl_step 1/6  loss=0.0762  mean_reward=0.75
+rl_step 2/6  loss=0.0280  mean_reward=0.94
+rl_step 3/6  loss=0.0003  mean_reward=1.00
+rl_step 4/6  loss=0.0251  mean_reward=0.94
+rl_step 5/6  loss=0.0054  mean_reward=1.00
+rl_step 6/6  loss=0.0095  mean_reward=1.00
+```
+
+`Qwen/Qwen2-0.5B-Instruct` already gets simple antonyms right most of the
+time, so `mean_reward` starts fairly high (~0.75-0.94) rather than near
+zero — this is a smoke test for the wire contract, not a hard RL benchmark.
+Reward is noisy step to step (4 prompts x 4 samples = 16 rollouts per step
+is a small group), but converges to 1.00.
+
+## Cost / Time
+
+Six RL steps (24 samples + 16 completions worth of `forward_backward` +
+`optim_step` each) ran in **~9 seconds** on an idle RTX PRO 6000. Real GRPO
+runs use far more prompts and samples per group — this is sized to be a
+fast, honest smoke test of the loop's wiring, not a tuned RL recipe.
+
+## Common Failures
+
+- **Wire key is `logprobs`, not `old_logprobs`.** The Python-side
+  `LossInputs.old_logprobs` field is populated from a `loss_fn_inputs` key
+  literally named `logprobs` on the wire (`_require_rl_inputs` raises
+  `"grpo requires 'logprobs' in loss_fn_inputs"` if it's missing). Sending
+  a key named `old_logprobs` instead silently fails this check.
+- **Zero-variance reward groups.** If every completion in a group gets the
+  identical reward, `std_r` collapses toward zero and (without the
+  `max(std_r, 1e-6)` clamp) advantages divide-by-zero — and even with the
+  clamp, a zero-variance group contributes no learning signal. Use more
+  samples per prompt or a reward with more granularity if a task is too
+  easy or too hard for the current policy.
+- **Sampling at `temperature=0`.** Deterministic sampling means every
+  completion in a group is identical, so rewards (and advantages) can't
+  differ within the group. Use `temperature > 0` during rollout collection;
+  save `temperature=0` for evaluation.
+- **Confusing `forward_backward`'s `loss_fn="grpo"` with `forward_backward_custom`.**
+  If your reward is expressible as "some function of a reward score," you
+  almost always want the built-in RL losses (`grpo`, `ppo`, `cispo`,
+  `dapo`, `gspo`) with `old_logprobs`/`advantages`, not the two-step custom
+  protocol from [Custom Loss](custom-loss) — that path exists for losses
+  that aren't expressible as a token-weighted function of `old_logprobs`
+  and `advantages` at all.
+
+## Next Steps
+
+- [Custom Loss](custom-loss): the two-step protocol for losses `grpo`/`ppo`
+  can't express.
+- [Save/Resume + Sampling](save-resume): checkpoint an RL run mid-training.
+- [API endpoints](../reference/endpoints): the full route reference.

@@ -1,0 +1,249 @@
+---
+title: "Custom Loss: The forward_backward_custom Wire Contract"
+description: A confidence-adaptive weighted loss via the two-step forward_backward_custom_step1/step2 protocol.
+---
+
+## Goal
+
+Implement a loss function the server doesn't know about, using the two-step
+`forward_backward_custom_step1` / `forward_backward_custom_step2` protocol
+instead of the built-in `loss_fn` values (`cross_entropy`, `grpo`, `ppo`,
+...).
+
+The built-in `cross_entropy` loss already accepts a `weights` tensor for
+static per-token weighting, so a plain weighted cross-entropy doesn't need
+this path. The two-step protocol earns its keep for losses that are a
+function of the model's *own current output* — something you can't
+precompute into a `weights` tensor before the forward pass runs. This
+recipe builds a **confidence-adaptive (focal-style) weighted loss**: tokens
+the model already predicts confidently count for less, tokens it's unsure
+about dominate the gradient. The weight is `(1 - p_t) ** gamma` where `p_t`
+is the model's own predicted probability for the target token — which only
+exists after the server runs a forward pass.
+
+## The Wire Contract
+
+1. **Step 1** (`POST /api/v1/forward_backward_custom_step1`): send `data`
+   (the same `Datum` shape as `forward_backward`) plus a client-generated
+   `custom_id`. The server runs a forward pass (no backward) and returns
+   per-position `log π(target_t | x_<t)` for every `Datum`, ragged per item
+   (each list is exactly as long as that item's input). It also caches the
+   collated batch server-side, keyed by `custom_id`.
+2. **Client-side**: turn the returned logprobs into a `torch.Tensor` with
+   `requires_grad=True`, compute your custom loss on it, call
+   `.backward()`, and read off `.grad` — that's `grad_logprobs`.
+3. **Step 2** (`POST /api/v1/forward_backward_custom_step2`): send the same
+   `custom_id` plus `grad_logprobs`. The server re-runs the forward pass
+   under autograd and builds a surrogate loss
+   `Σ grad_logprobs.detach() * logprobs`, whose backward pass produces
+   *exactly* the parameter gradient your custom loss would have produced —
+   without the custom loss itself ever running server-side.
+
+Step 1 and step 2 must land on the same worker (the `custom_id` cache is
+in-memory and worker-local); the gateway pins both requests to the
+session's preferred worker to guarantee this.
+
+Because there's no SDK convenience method for this two-step flow, the
+recipe below talks to the raw `/api/v1/*` endpoints with `httpx` directly
+— this is also the clearest way to see the wire contract explicitly.
+
+## Script
+
+Save as `custom_loss.py` and run with `python custom_loss.py` against a
+running gateway (see [SFT Quickstart](sft-quickstart) for how to start
+one):
+
+```python
+"""Confidence-adaptive weighted loss via forward_backward_custom_step1/step2."""
+
+import os
+import time
+
+import httpx
+import torch
+from transformers import AutoTokenizer
+
+from hatchery.client import HatcheryClient
+
+BASE_URL = os.environ.get("HATCHERY_BASE_URL", "http://127.0.0.1:8420")
+TOKEN = os.environ.get("HATCHERY_API_KEY", "dev")
+BASE_MODEL = "Qwen/Qwen2-0.5B-Instruct"
+
+FOCAL_GAMMA = 2.0  # higher = more aggressively downweight already-confident tokens
+
+
+def submit_and_wait(http: httpx.Client, path: str, body: dict) -> dict:
+    """Raw wire call: POST the op, then long-poll /retrieve_future for the result."""
+    resp = http.post(path, json=body)
+    resp.raise_for_status()
+    request_id = resp.json()["request_id"]
+    while True:
+        retr = http.post("/api/v1/retrieve_future", json={"request_id": request_id})
+        retr.raise_for_status()
+        result = retr.json()
+        if result.get("type") == "try_again":
+            time.sleep(0.05)
+            continue
+        if result.get("type") == "request_failed":
+            raise RuntimeError(f"{path} failed: {result.get('error')}")
+        return result
+
+
+def main() -> None:
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+
+    client = HatcheryClient(base_url=BASE_URL, token=TOKEN)
+    tc = client.create_lora_training_client(BASE_MODEL, rank=8)
+    print(f"session: {tc.model_id}")
+
+    prompt = "Give one interesting fact about octopuses."
+    completion = "Octopuses have three hearts and blue, copper-based blood."
+    prompt_ids = tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+    )
+    full_ids = tok.apply_chat_template(
+        [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": completion},
+        ],
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=False,
+    )
+    input_ids = full_ids[:-1]
+    labels = [-100] * (len(prompt_ids) - 1) + full_ids[len(prompt_ids) :]
+    datum = {
+        "model_input": {"chunks": [{"type": "encoded_text", "tokens": input_ids}]},
+        "loss_fn_inputs": {"target_tokens": {"data": labels, "shape": [len(labels)]}},
+    }
+
+    http = httpx.Client(
+        base_url=BASE_URL,
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=60.0,
+    )
+
+    for step in range(1, 6):
+        # -- Step 1: server runs the forward pass, returns per-position --
+        # log pi(target_t | x_<t) for every Datum. No backward yet.
+        custom_id = f"focal-{step}"
+        step1 = submit_and_wait(
+            http,
+            "/api/v1/forward_backward_custom_step1",
+            {
+                "model_id": tc.model_id,
+                "seq_id": step,
+                "forward_backward_input": {"data": [datum], "custom_id": custom_id},
+            },
+        )
+        logprobs = torch.tensor(step1["logprobs"][0], requires_grad=True)
+
+        # -- Client-side custom loss: focal-weighted NLL. Tokens the --
+        # model already predicts confidently (p_t close to 1) count for
+        # less; low-confidence tokens dominate the gradient. This needs
+        # the model's own live logprobs, so it cannot be expressed as a
+        # static `weights` tensor computed before the forward pass.
+        target_mask = torch.tensor(
+            [1.0 if lbl != -100 else 0.0 for lbl in labels[-len(logprobs) :]]
+        )
+        p_t = logprobs.exp()
+        focal_weight = ((1 - p_t) ** FOCAL_GAMMA).detach()
+        per_token_loss = -focal_weight * logprobs * target_mask
+        loss = per_token_loss.sum() / target_mask.sum().clamp_min(1.0)
+        loss.backward()
+        grad_logprobs = logprobs.grad.tolist()
+
+        # -- Step 2: hand the gradient back; the server runs a surrogate --
+        # backward pass that reproduces the same parameter gradient the
+        # client-side loss would have produced, then accumulates it.
+        step2 = submit_and_wait(
+            http,
+            "/api/v1/forward_backward_custom_step2",
+            {
+                "model_id": tc.model_id,
+                "seq_id": step,
+                "forward_backward_input": {
+                    "custom_id": custom_id,
+                    "grad_logprobs": [grad_logprobs],
+                },
+            },
+        )
+        tc.optim_step(learning_rate=1e-4).result(timeout=30)
+        print(
+            f"step {step}  focal_loss={loss.item():.4f}  "
+            f"surrogate={step2['surrogate']:.4f}  accum_steps={step2['accum_steps']}"
+        )
+
+    ckpt = tc.save_weights("focal-adapter").result(timeout=30)
+    print(f"checkpoint: {ckpt['path']}")
+
+    client.close()
+    http.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Expected Output
+
+```text
+session: mdl_09b7de68e25546f0b43e722c2193ee50
+step 1  focal_loss=2.8808  surrogate=2.8808  accum_steps=1
+step 2  focal_loss=2.5957  surrogate=2.5957  accum_steps=1
+step 3  focal_loss=2.0725  surrogate=2.0725  accum_steps=1
+step 4  focal_loss=1.6115  surrogate=1.6115  accum_steps=1
+step 5  focal_loss=1.1552  surrogate=1.1552  accum_steps=1
+checkpoint: tinker://mdl_09b7de68e25546f0b43e722c2193ee50/checkpoints/focal-adapter
+```
+
+`focal_loss` and `surrogate` match exactly every step — that's not a
+coincidence, it's the invariant the protocol is built on.
+`grad_logprobs = d(loss)/d(logprobs)`, and since `focal_weight` is detached,
+`surrogate = Σ logprobs * grad_logprobs = loss` algebraically. If your own
+custom-loss implementation ever prints a `surrogate` that *doesn't* match
+your client-side loss value, that's a sign your gradient computation (not
+just the loss value) is wrong.
+
+## Cost / Time
+
+Five step1/step2 round trips plus five `optim_step` calls on
+`Qwen/Qwen2-0.5B-Instruct` (rank-8 LoRA) ran in **~6 seconds** on an idle
+RTX PRO 6000. Each step issues 3 sequential HTTP round trips (step1, step2,
+optim_step), so wall-clock is dominated by request/poll latency rather than
+compute at this scale.
+
+## Common Failures
+
+- **`no cached forward for custom_id=...`.** Step 2 needs step 1's cached
+  activations for the *same* `custom_id`. This fires if you reuse a
+  `custom_id` after it's already been consumed by a step2 call (the cache
+  entry is evicted on read), typo the `custom_id` between calls, or — in a
+  multi-worker deployment — step1 and step2 land on different workers (the
+  cache is worker-local; the gateway pins both calls to the same worker via
+  `preferred_worker`, but this can't be guaranteed if you route around the
+  gateway).
+- **`grad_logprobs shape != logprobs shape`.** `surrogate_loss_from_grad`
+  validates that the gradient you send back has the same shape as the
+  logprobs step1 gave you. This usually means you reshaped/padded
+  `grad_logprobs` differently than the ragged per-item list step1 returned.
+- **`.grad` is `None`.** Forgetting `requires_grad=True` when building the
+  `torch.Tensor` from `step1["logprobs"]`, or forgetting to call
+  `.backward()` before reading `.grad`.
+- **Reaching for this when you don't need it.** If your loss is a static
+  per-token multiplier known before the forward pass, use `cross_entropy`
+  with a `weights` tensor in `loss_fn_inputs` instead — it's one HTTP round
+  trip instead of three, and there's no custom-gradient bookkeeping to get
+  wrong.
+
+## Next Steps
+
+- [SFT Quickstart](sft-quickstart): the canonical `forward_backward` +
+  `optim_step` loop this recipe extends.
+- [RL-Style Loop](rl-loop): a different way to shape gradients — sampling,
+  rewards, and the built-in `grpo` loss.
+- [API endpoints](../reference/endpoints): the full route reference,
+  including `forward_backward_custom_step1`/`step2`.

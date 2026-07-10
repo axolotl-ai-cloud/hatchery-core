@@ -27,7 +27,10 @@
       {
         "group": "Cookbook",
         "pages": [
-          "content/docs/cookbook"
+          "content/docs/cookbook/sft-quickstart",
+          "content/docs/cookbook/custom-loss",
+          "content/docs/cookbook/rl-loop",
+          "content/docs/cookbook/save-resume"
         ]
       },
       {

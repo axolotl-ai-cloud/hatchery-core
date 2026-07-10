@@ -13,7 +13,8 @@ Use it to prototype SFT, RL-style objectives, custom losses, and sampling recipe
 - [Migrating From Tinker](getting-started/tinker-migration): point the official Tinker SDK (or `hatchery-client`) at a Hatchery gateway.
 - [Architecture](learn/architecture): understand the control plane, worker, storage, and job flow.
 - [API endpoints](reference/endpoints): use the native and Tinker-compatible HTTP surfaces.
-- [Cookbook](cookbook): worked SFT and style-transfer training examples.
+- [Cookbook](cookbook): worked SFT, custom-loss, RL, and save/resume
+  training examples.
 - [Self-hosting](getting-started/self-hosting): run open core outside the local dev launcher.
 
 For enterprise or self-hosted deployment questions, or if you need help adapting Hatchery to a sensitive workflow, contact `contact@axolotl.ai`.
@@ -31,7 +32,8 @@ For enterprise or self-hosted deployment questions, or if you need help adapting
 - Incorporate optimized Axolotl training patches and kernels where they improve throughput, memory use, or model-family coverage.
 - Expand multi-modal validation for VLM training, sampling, and checkpoint flows.
 - Harden distributed and multi-worker self-hosting patterns with shared queue and object-store backends.
-- Add more end-to-end cookbooks for SFT, RL, style-transfer, and custom-loss workflows.
+- Add more end-to-end cookbooks for additional model families, multi-GPU
+  training, and style-transfer/preference-tuning workflows.
 - Improve observability around loss, token throughput, queue latency, GPU memory, and checkpoint operations.
 - Stabilize the public API and configuration surface for a non-alpha release.
 
